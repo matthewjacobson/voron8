@@ -1,7 +1,12 @@
 name: Publish
 
-# Publishes to npm when a version tag (e.g. v0.1.0) is pushed.
-# Requires an NPM_TOKEN repository secret with publish rights.
+# Publishes to npm when a version tag (e.g. v0.1.0) is pushed, using npm
+# Trusted Publishing (OIDC) — no NPM_TOKEN secret required.
+#
+# One-time bootstrap: OIDC can't create a package, only publish to an existing
+# one. Publish the first version locally (`npm publish` while logged in), then
+# add this repo + workflow as a Trusted Publisher under the package's npm
+# settings. Every release after that flows through this workflow.
 on:
   push:
     tags:
@@ -12,22 +17,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # enables npm provenance attestation
+      id-token: write # mints the OIDC token npm exchanges for publish auth
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: "https://registry.npmjs.org"
-          cache: npm
+          # Trusted publishing requires Node >= 22.14.0.
+          node-version: 22
+
+      # ...and npm >= 11.5.1, which is newer than the runner's bundled npm.
+      - run: npm install -g npm@latest
 
       - run: npm ci
 
       - run: npm test
 
-      # prepublishOnly runs `npm run build`; --provenance attests the build,
-      # --access public publishes the (unscoped) package publicly.
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # No token, no --provenance: OIDC authenticates the publish and npm
+      # generates the provenance attestation automatically.
+      - run: npm publish

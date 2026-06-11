@@ -125,6 +125,22 @@ Override header locations with `CGAL_INCLUDE_DIR` / `BOOST_INCLUDE_DIR` if they 
 
 CGAL's own examples use filtered traits (`EPICK`/`EPECK`), which rely on interval arithmetic for speed. But interval arithmetic needs to switch the CPU's floating-point **rounding mode**, and **WebAssembly cannot set the rounding mode** — making those predicates unsound here. voron8 therefore uses a pure exact rational kernel, `Simple_cartesian<Quotient<MP_Float>>` with `Field_tag` traits: slower, but correct and deterministic in the browser. Insertion still uses CGAL's spatial-sorted `insert_segments`, which recovers much of the lost speed by improving locality.
 
+## Releasing
+
+Releases publish to npm via [Trusted Publishing (OIDC)](https://docs.npmjs.com/trusted-publishers/) — no npm token is stored in the repo. The `Publish` workflow runs on `v*` tags, authenticates through GitHub's OIDC, and npm attaches a provenance attestation automatically.
+
+One-time bootstrap (OIDC cannot create a package, only publish to an existing one):
+
+1. `npm login`, then `npm publish` locally to create the package's first version.
+2. On npmjs.com → the package → **Settings → Trusted Publisher**, add: organization `matthewjacobson`, repository `voron8`, workflow `publish.yml`.
+
+After that, each release is just:
+
+```sh
+npm version patch   # bumps package.json and creates the matching git tag
+git push --follow-tags
+```
+
 ## License
 
 MIT (this wrapper). Note that CGAL itself is distributed under GPL/LGPL terms; the compiled wasm links CGAL's headers, so your use of the wasm artifact is subject to CGAL's licensing.
