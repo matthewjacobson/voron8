@@ -140,7 +140,19 @@ const L_SHAPE = [
   ],
 ];
 
-test("medialAxis drops edges defined by a reflex vertex", async () => {
+// Whether an edge bisects a point site and a segment site incident to it
+// (a polygon vertex and one of its own edges) — the degenerate, non-medial case.
+function isIncidentBisector(e) {
+  const same = (a, b) => a && b && a.polygon === b.polygon && a.vertex === b.vertex;
+  const inc = (pt, seg) =>
+    pt.type === "point" &&
+    seg.type === "segment" &&
+    seg.segment &&
+    (same(pt.source, seg.segment[0]) || same(pt.source, seg.segment[1]));
+  return inc(e.sites[0], e.sites[1]) || inc(e.sites[1], e.sites[0]);
+}
+
+test("medialAxis drops only the degenerate incident bisectors", async () => {
   const full = await voronoi(L_SHAPE);
   const medial = await medialAxis(L_SHAPE);
 
@@ -151,40 +163,37 @@ test("medialAxis drops edges defined by a reflex vertex", async () => {
     "medial axis prunes some interior edges",
   );
 
-  // Every medial edge is interior and free of the reflex vertex (0:3).
+  // Nothing kept is an incident bisector...
   for (const e of medial.edges) {
     assert.equal(e.location, "interior");
-    for (const s of e.sites) {
-      assert.ok(
-        !(s.type === "point" && s.source && s.source.polygon === 0 && s.source.vertex === 3),
-        "no medial edge is defined by the reflex vertex",
-      );
+    assert.ok(!isIncidentBisector(e), "no medial edge is an incident bisector");
+  }
+  // ...and everything pruned is exactly an incident bisector.
+  const medialKey = new Set(medial.edges.map((e) => `${e.from},${e.to}`));
+  for (const e of interior) {
+    if (!medialKey.has(`${e.from},${e.to}`)) {
+      assert.ok(isIncidentBisector(e), "every pruned interior edge is an incident bisector");
     }
   }
+});
 
-  // At least one pruned interior edge WAS defined by the reflex vertex.
-  const prunedReflex = interior.some((e) =>
-    e.sites.some(
-      (s) => s.type === "point" && s.source && s.source.polygon === 0 && s.source.vertex === 3,
-    ),
-  );
-  assert.ok(prunedReflex, "the reflex vertex did define interior edges that got pruned");
-
-  // The medial axis has its leaves at convex corners and stops short of the
-  // reflex corner (whose interior wedge is the pruned reflex point-cell).
-  const touches = (x, y) =>
-    medial.edges.some((e) =>
-      [e.from, e.to].some((idx) => {
-        const v = medial.vertices[idx];
-        return v && Math.abs(v.x - x) < 1e-9 && Math.abs(v.y - y) < 1e-9;
-      }),
-    );
-  assert.ok(touches(0, 0), "medial axis reaches a convex corner");
-  assert.ok(!touches(2, 2), "medial axis does not reach the reflex corner");
+test("parabolic arcs are always part of the medial axis", async () => {
+  // The arc bisectors (reflex vertex vs. a facing wall) are genuine medial axis
+  // edges — a regression guard against over-pruning them.
+  const full = await voronoi(L_SHAPE);
+  const medial = await medialAxis(L_SHAPE);
+  const interiorParabolas = full.edges.filter(
+    (e) => e.location === "interior" && e.geometry.type === "parabola",
+  ).length;
+  const medialParabolas = medial.edges.filter(
+    (e) => e.geometry.type === "parabola",
+  ).length;
+  assert.ok(interiorParabolas > 0, "the L-shape has interior parabolic bisectors");
+  assert.equal(medialParabolas, interiorParabolas, "no parabolic arc is pruned");
 });
 
 test("a convex polygon's medial axis equals its interior edges", async () => {
-  // No reflex vertices, so nothing is pruned.
+  // No reflex vertices, so there are no interior incident bisectors to prune.
   const full = await voronoi(SQUARE);
   const medial = await medialAxis(SQUARE);
   const interior = full.edges.filter((e) => e.location === "interior");

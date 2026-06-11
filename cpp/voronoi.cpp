@@ -131,28 +131,40 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
   // A Voronoi edge is the bisector of the two sites sitting across it; those are
   // the ccw/cw vertices of the Delaunay edge. We report each so callers can,
   // e.g., drop bisectors defined by a reflex vertex when extracting a medial axis.
+  // Map a point back to its input {polygon, vertex}, or null if it isn't an
+  // input corner (e.g. a segment-intersection point).
+  auto vref = [&](const Point_2& p) -> emscripten::val {
+    auto hit = inputIndex.find(p);
+    if (hit == inputIndex.end()) return emscripten::val::null();
+    emscripten::val r = emscripten::val::object();
+    r.set("polygon", hit->second.first);
+    r.set("vertex", hit->second.second);
+    return r;
+  };
+
   auto describe_site = [&](Vertex_handle v) {
     emscripten::val s = emscripten::val::object();
     if (sdg.is_infinite(v)) {
       s.set("type", std::string("infinite"));
       s.set("source", emscripten::val::null());
+      s.set("segment", emscripten::val::null());
       return s;
     }
     const Site_2 site = v->site();
     if (site.is_point()) {
       s.set("type", std::string("point"));
-      auto hit = inputIndex.find(site.point());
-      if (hit != inputIndex.end()) {
-        emscripten::val src = emscripten::val::object();
-        src.set("polygon", hit->second.first);
-        src.set("vertex", hit->second.second);
-        s.set("source", src);
-      } else {
-        s.set("source", emscripten::val::null());  // e.g. a segment-intersection point
-      }
+      s.set("source", vref(site.point()));
+      s.set("segment", emscripten::val::null());
     } else {
+      // Report the segment's endpoint provenance so callers can test whether a
+      // point site is incident to this segment (an adjacency that produces a
+      // spurious, non-medial bisector).
       s.set("type", std::string("segment"));
       s.set("source", emscripten::val::null());
+      emscripten::val seg = emscripten::val::array();
+      seg.set(0, vref(site.source()));
+      seg.set(1, vref(site.target()));
+      s.set("segment", seg);
     }
     return s;
   };
