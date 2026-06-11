@@ -21,10 +21,21 @@
     <header>
       <h1>voron8 — medial axis</h1>
       <label>polygon <select id="pick"></select></label>
-      <label><input type="checkbox" id="showVoronoi" checked /> show pruned interior edges</label>
+      <label>prune by
+        <select id="mode">
+          <option value="none">none</option>
+          <option value="length">branch length (distance)</option>
+          <option value="area">branch area</option>
+          <option value="angle">corner sharpness (axial angle)</option>
+        </select>
+      </label>
+      <label><input type="range" id="thresh" min="0" max="100" value="0" step="1" disabled />
+        <span id="threshVal" style="min-width:5ch">—</span>
+      </label>
       <div class="legend">
         <span><span class="swatch" style="background:#3b82f6"></span>polygon</span>
-        <span><span class="swatch" style="background:#6b7280"></span>pruned (reflex) edges</span>
+        <span><span class="swatch" style="background:#374151"></span>pruned interior</span>
+        <span><span class="swatch" style="background:#15803d"></span>feature-pruned</span>
         <span><span class="swatch" style="background:#22c55e"></span>medial axis</span>
       </div>
       <span class="status" id="status"></span>
@@ -35,6 +46,7 @@
     <script type="module">
       // Built bundle (run `npm run build`, then serve the repo and open /example/medial-axis.html).
       import { voronoi, medialAxis, tessellate } from "../dist/voron8.js";
+      import { precomputeMetrics, prune } from "./prune.js";
 
       // Polygons from LingDong-/interesting-polygon-archive (JSON: a 3D array
       // of contours -> vertices -> [x, y]; contour 0 is the outer ring, the
@@ -50,7 +62,9 @@
       ];
 
       const pick = document.getElementById("pick");
-      const showVoronoi = document.getElementById("showVoronoi");
+      const mode = document.getElementById("mode");
+      const thresh = document.getElementById("thresh");
+      const threshVal = document.getElementById("threshVal");
       const statusEl = document.getElementById("status");
       for (const n of NAMES) {
         const o = document.createElement("option");
@@ -61,7 +75,17 @@
       const canvas = document.getElementById("c");
       const ctx = canvas.getContext("2d");
 
-      let current = null; // { polygons, full, medial }
+      let current = null; // { polygons, full, medial, metrics, bbox, alive }
+
+      function bboxOf(polygons) {
+        let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+        for (const ring of polygons)
+          for (const [x, y] of ring) {
+            if (x < minx) minx = x; if (x > maxx) maxx = x;
+            if (y < miny) miny = y; if (y > maxy) maxy = y;
+          }
+        return { minx, miny, maxx, maxy, diag: Math.hypot(maxx - minx, maxy - miny) };
+      }
 
       async function loadPolygon(name) {
         statusEl.textContent = `loading ${name}…`;
@@ -73,21 +97,52 @@
           voronoi(polygons),
           medialAxis(polygons),
         ]);
-        current = { polygons, full, medial };
-        const nVerts = polygons.reduce((s, r) => s + r.length, 0);
-        statusEl.textContent = `${name}: ${nVerts} vertices, ${medial.edges.length} medial edges`;
+        const metrics = precomputeMetrics(medial, polygons, tessellate, 24);
+        current = { polygons, full, medial, metrics, bbox: bboxOf(polygons), alive: null };
+        configureSlider();
+        applyPrune();
         resize();
+      }
+
+      // Set the slider's range to match the chosen measure and current shape.
+      function configureSlider() {
+        if (!current) return;
+        const off = mode.value === "none";
+        thresh.disabled = off;
+        const { diag, minx, miny, maxx, maxy } = current.bbox;
+        let max, step;
+        if (mode.value === "length") { max = 0.5 * diag; step = max / 400; }
+        else if (mode.value === "area") { max = 0.05 * (maxx - minx) * (maxy - miny); step = max / 400; }
+        else if (mode.value === "angle") { max = 180; step = 1; }
+        else { max = 100; step = 1; }
+        thresh.max = max;
+        thresh.step = step || 1;
+        thresh.value = 0;
+        updateThreshLabel();
+      }
+
+      function updateThreshLabel() {
+        if (mode.value === "none") { threshVal.textContent = "—"; return; }
+        const v = +thresh.value;
+        threshVal.textContent =
+          mode.value === "angle" ? `${v.toFixed(0)}°`
+          : mode.value === "area" ? v.toFixed(0)
+          : v.toFixed(1);
+      }
+
+      function applyPrune() {
+        if (!current) return;
+        current.alive = prune(current.medial, current.metrics, mode.value, +thresh.value);
+        const kept = current.alive.filter(Boolean).length;
+        const nVerts = current.polygons.reduce((s, r) => s + r.length, 0);
+        statusEl.textContent =
+          `${pick.value}: ${nVerts} vertices · ${kept}/${current.medial.edges.length} medial edges kept`;
       }
 
       // Fit the polygon bounding box into the canvas (image coords are Y-down,
       // which maps directly to canvas, so no flip).
       function makeProjector() {
-        let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
-        for (const ring of current.polygons)
-          for (const [x, y] of ring) {
-            if (x < minx) minx = x; if (x > maxx) maxx = x;
-            if (y < miny) miny = y; if (y > maxy) maxy = y;
-          }
+        const { minx, miny, maxx, maxy } = current.bbox;
         const pad = 24;
         const w = canvas.clientWidth, h = canvas.clientHeight;
         const scale = Math.min((w - 2 * pad) / (maxx - minx || 1), (h - 2 * pad) / (maxy - miny || 1));
@@ -110,6 +165,7 @@
         ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
         if (!current) return;
         const P = makeProjector();
+        const project = (g, n) => tessellate(g, { parabolaSamples: n }).map((p) => P(p.x, p.y));
 
         // Filled polygon (even-odd so holes punch through).
         ctx.beginPath();
@@ -126,18 +182,20 @@
         ctx.lineWidth = 1.25;
         ctx.stroke();
 
-        // Pruned interior edges (interior edges that the medial axis drops).
-        if (showVoronoi.checked) {
-          for (const e of current.full.edges) {
-            if (e.location !== "interior") continue;
-            polyline(tessellate(e.geometry, { parabolaSamples: 20 }).map((p) => P(p.x, p.y)), "#4b5563", 1);
-          }
+        // Interior Voronoi edges the medial axis already drops (incident bisectors).
+        for (const e of current.full.edges) {
+          if (e.location === "interior") polyline(project(e.geometry, 20), "#374151", 1);
         }
 
-        // Medial axis on top.
-        for (const e of current.medial.edges) {
-          polyline(tessellate(e.geometry, { parabolaSamples: 24 }).map((p) => P(p.x, p.y)), "#22c55e", 2);
-        }
+        // Medial axis: feature-pruned branches dim, survivors bright on top.
+        current.medial.edges.forEach((e, i) => {
+          if (current.alive && current.alive[i]) return;
+          polyline(project(e.geometry, 24), "#15803d", 1.5);
+        });
+        current.medial.edges.forEach((e, i) => {
+          if (current.alive && !current.alive[i]) return;
+          polyline(project(e.geometry, 24), "#22c55e", 2);
+        });
       }
 
       function resize() {
@@ -149,7 +207,8 @@
       }
 
       window.addEventListener("resize", resize);
-      showVoronoi.addEventListener("change", draw);
+      mode.addEventListener("change", () => { configureSlider(); applyPrune(); draw(); });
+      thresh.addEventListener("input", () => { updateThreshLabel(); applyPrune(); draw(); });
       pick.addEventListener("change", () =>
         loadPolygon(pick.value).catch((e) => (statusEl.textContent = "error: " + e.message)),
       );
