@@ -4,6 +4,8 @@
 
 The segment **Voro**noi diagram of polygons, computed by [CGAL](https://www.cgal.org/) and shipped as WebAssembly.
 
+**[Live demo →](https://matthewjacobson.github.io/voron8/)**
+
 Give it an array of polygons; get back a graph of Voronoi vertices and edges where:
 
 - **every edge is labeled `interior` or `exterior`** relative to the even-odd filled input region (so it doubles as a medial-axis / shape-skeleton extractor), and
