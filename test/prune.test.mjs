@@ -93,6 +93,41 @@ test("axial pruning keeps shallow-gradient edges and drops steep tapers", async 
   });
 });
 
+test("area threshold normalizes per connected component", async () => {
+  // A big square and a far-off tiny square — two disconnected medial components.
+  const big = [[0, 0], [100, 0], [100, 100], [0, 100]];
+  const small = [[300, 300], [310, 300], [310, 310], [300, 310]];
+  const medial = await medialAxis([big, small]);
+  const tree = buildMedialTree(medial, [big, small], tessellate, 24);
+  assert.equal(tree.roots.length, 2, "two disconnected components");
+
+  // The small component (smaller root feature area) and the nodes reachable
+  // from its root.
+  const smallRoot = [...tree.roots].sort(
+    (a, b) => tree.featureArea.get(a) - tree.featureArea.get(b),
+  )[0];
+  const comp = new Set([smallRoot]);
+  const stack = [smallRoot];
+  while (stack.length) {
+    const u = stack.pop();
+    for (const { child } of tree.children.get(u) || []) { comp.add(child); stack.push(child); }
+  }
+
+  const t = 0.5;
+  const alive = pruneTree(tree, 0, 0, t);
+  const smallKept = tree.edges.filter((e, i) => alive[i] && comp.has(e.from) && comp.has(e.to)).length;
+  assert.ok(smallKept > 0, "small component survives on its own area scale");
+
+  // And confirm global (sum-of-roots) normalization WOULD have wiped it: the
+  // small component's largest subtree is below the global mapped threshold.
+  const globalMapped = t ** 3 * tree.totalArea;
+  let smallMaxChild = 0;
+  for (const { child } of tree.children.get(smallRoot) || []) {
+    smallMaxChild = Math.max(smallMaxChild, tree.featureArea.get(child));
+  }
+  assert.ok(smallMaxChild < globalMapped, "global normalization would have removed it");
+});
+
 test("works on a real archived polygon (mapbox-building)", async () => {
   const url =
     "https://raw.githubusercontent.com/LingDong-/interesting-polygon-archive/master/json/mapbox-building.json";

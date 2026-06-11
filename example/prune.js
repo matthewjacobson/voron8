@@ -189,13 +189,16 @@ export function pruneTree(tree, axialThreshold, distanceThreshold, areaThreshold
   const a = clamp01(axialThreshold);
   const mappedAxial = tree.minGrad + (tree.maxGrad - tree.minGrad) * (a * a * a);
   const mappedDistance = tree.furthestDistance * (1 - clamp01(distanceThreshold));
-  const ar = clamp01(areaThreshold);
-  const mappedArea = ar * ar * ar * tree.totalArea;
+  const areaFrac = clamp01(areaThreshold) ** 3;
 
   const alive = tree.edges.map(() => false);
   const aliveNode = new Set();
 
   for (const root of tree.roots) {
+    // Area is normalized per connected component — relative to this root's own
+    // whole-component feature area — so a small shape sharing the input isn't
+    // swamped by a larger one's scale.
+    const mappedArea = areaFrac * (tree.featureArea.get(root) || 0);
     aliveNode.add(root);
     const stack = [root];
     while (stack.length) {
