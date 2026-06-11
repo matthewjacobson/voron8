@@ -1,0 +1,46 @@
+{
+  "name": "voron8",
+  "version": "0.1.0",
+  "description": "CGAL segment Voronoi diagram of polygons, in WebAssembly — edges labeled interior/exterior, vertices traced back to input geometry.",
+  "type": "module",
+  "main": "dist/voron8.js",
+  "module": "dist/voron8.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/voron8.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "cpp",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "build": "node scripts/bundle.mjs",
+    "build:all": "npm run build:wasm && npm run build",
+    "prepublishOnly": "npm run build",
+    "test": "node --test"
+  },
+  "keywords": [
+    "voronoi",
+    "cgal",
+    "wasm",
+    "webassembly",
+    "segment-voronoi",
+    "medial-axis",
+    "computational-geometry",
+    "delaunay"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

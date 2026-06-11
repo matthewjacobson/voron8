@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>voron8 — segment Voronoi of polygons</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+      header { padding: 12px 16px; border-bottom: 1px solid #232733; }
+      header h1 { margin: 0 0 4px; font-size: 16px; }
+      .legend { display: flex; gap: 16px; flex-wrap: wrap; color: #9aa4b2; }
+      .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; }
+      canvas { display: block; width: 100%; height: calc(100vh - 64px); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>voron8 — segment Voronoi of polygons</h1>
+      <div class="legend">
+        <span><span class="swatch" style="background:#3b82f6"></span>input polygons</span>
+        <span><span class="swatch" style="background:#22c55e"></span>interior edges (medial axis)</span>
+        <span><span class="swatch" style="background:#6b7280"></span>exterior edges</span>
+        <span><span class="swatch" style="background:#f59e0b"></span>input-corner vertices</span>
+        <span><span class="swatch" style="background:#e6e6e6"></span>Voronoi vertices</span>
+      </div>
+    </header>
+    <canvas id="c"></canvas>
+
+    <script type="module">
+      // Built artifact. Run `npm run build` first, then serve this folder:
+      //   npx serve .    (or any static server)  and open /example/
+      import { voronoi, tessellate } from "../dist/voron8.js";
+
+      // An L-shape (reflex corner -> parabolic bisectors) plus a triangle.
+      const polygons = [
+        [ [40, 40], [320, 40], [320, 180], [160, 180], [160, 360], [40, 360] ],
+        [ [420, 120], [620, 120], [520, 320] ],
+      ];
+
+      const { vertices, edges } = await voronoi(polygons);
+
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d");
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * dpr;
+        canvas.height = canvas.clientHeight * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        draw();
+      }
+      window.addEventListener("resize", resize);
+
+      function line(pts, color, width) {
+        if (pts.length < 2) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Clip rays/lines to the visible canvas so exterior edges stay sane.
+        const far = Math.max(canvas.clientWidth, canvas.clientHeight) * 2;
+
+        for (const e of edges) {
+          const pts = tessellate(e.geometry, { parabolaSamples: 28, infiniteLength: far });
+          line(pts, e.location === "interior" ? "#22c55e" : "#6b7280",
+               e.location === "interior" ? 2 : 1);
+        }
+
+        // Input polygons on top.
+        for (const ring of polygons) {
+          line([...ring, ring[0]].map(([x, y]) => ({ x, y })), "#3b82f6", 1.5);
+        }
+
+        // Vertices.
+        for (const v of vertices) {
+          ctx.fillStyle = v.isInput ? "#f59e0b" : "#e6e6e6";
+          ctx.beginPath();
+          ctx.arc(v.x, v.y, v.isInput ? 4 : 2.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      resize();
+    </script>
+  </body>
+</html>
