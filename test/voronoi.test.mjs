@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { voronoi, tessellate, init } from "../dist/voron8.js";
+import { voronoi, medialAxis, tessellate, init } from "../dist/voron8.js";
 
 const SQUARE = [
   [
@@ -110,6 +110,85 @@ test("a hole flips interior/exterior (even-odd fill)", async () => {
   for (const e of nearHoleCenter) {
     assert.equal(e.location, "exterior", "edges inside a hole are exterior");
   }
+});
+
+test("every edge reports its two defining sites", async () => {
+  const { edges } = await voronoi(SQUARE);
+  for (const e of edges) {
+    assert.equal(e.sites.length, 2);
+    for (const s of e.sites) {
+      assert.ok(["point", "segment", "infinite"].includes(s.type));
+      if (s.type === "point" && s.source) {
+        assert.equal(s.source.polygon, 0);
+        assert.ok(s.source.vertex >= 0 && s.source.vertex < 4);
+      } else {
+        assert.equal(s.source, null);
+      }
+    }
+  }
+});
+
+// An L-shape: one reflex (concave) vertex at index 3, (2,2).
+const L_SHAPE = [
+  [
+    [0, 0],
+    [6, 0],
+    [6, 2],
+    [2, 2], // reflex
+    [2, 6],
+    [0, 6],
+  ],
+];
+
+test("medialAxis drops edges defined by a reflex vertex", async () => {
+  const full = await voronoi(L_SHAPE);
+  const medial = await medialAxis(L_SHAPE);
+
+  const interior = full.edges.filter((e) => e.location === "interior");
+  assert.ok(medial.edges.length > 0, "medial axis is non-empty");
+  assert.ok(
+    medial.edges.length < interior.length,
+    "medial axis prunes some interior edges",
+  );
+
+  // Every medial edge is interior and free of the reflex vertex (0:3).
+  for (const e of medial.edges) {
+    assert.equal(e.location, "interior");
+    for (const s of e.sites) {
+      assert.ok(
+        !(s.type === "point" && s.source && s.source.polygon === 0 && s.source.vertex === 3),
+        "no medial edge is defined by the reflex vertex",
+      );
+    }
+  }
+
+  // At least one pruned interior edge WAS defined by the reflex vertex.
+  const prunedReflex = interior.some((e) =>
+    e.sites.some(
+      (s) => s.type === "point" && s.source && s.source.polygon === 0 && s.source.vertex === 3,
+    ),
+  );
+  assert.ok(prunedReflex, "the reflex vertex did define interior edges that got pruned");
+
+  // The medial axis has its leaves at convex corners and stops short of the
+  // reflex corner (whose interior wedge is the pruned reflex point-cell).
+  const touches = (x, y) =>
+    medial.edges.some((e) =>
+      [e.from, e.to].some((idx) => {
+        const v = medial.vertices[idx];
+        return v && Math.abs(v.x - x) < 1e-9 && Math.abs(v.y - y) < 1e-9;
+      }),
+    );
+  assert.ok(touches(0, 0), "medial axis reaches a convex corner");
+  assert.ok(!touches(2, 2), "medial axis does not reach the reflex corner");
+});
+
+test("a convex polygon's medial axis equals its interior edges", async () => {
+  // No reflex vertices, so nothing is pruned.
+  const full = await voronoi(SQUARE);
+  const medial = await medialAxis(SQUARE);
+  const interior = full.edges.filter((e) => e.location === "interior");
+  assert.equal(medial.edges.length, interior.length);
 });
 
 test("tessellate turns geometry into polylines", async () => {

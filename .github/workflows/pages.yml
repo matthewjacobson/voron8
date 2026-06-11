@@ -37,7 +37,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site/example _site/dist
-          cp example/index.html _site/example/index.html
+          cp -r example/. _site/example/
           cp dist/voron8.js _site/dist/voron8.js
           printf '<!doctype html><meta http-equiv="refresh" content="0; url=./example/">\n' > _site/index.html
 

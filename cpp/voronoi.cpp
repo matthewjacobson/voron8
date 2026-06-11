@@ -27,9 +27,11 @@ typedef CGAL::Simple_cartesian<NT>                                  K;
 typedef CGAL::Segment_Delaunay_graph_traits_2<K, CGAL::Field_tag>   Gt;
 typedef CGAL::Segment_Delaunay_graph_2<Gt>                          SDG;
 
-typedef SDG::Point_2     Point_2;
-typedef SDG::Face_handle Face_handle;
-typedef SDG::Edge        Edge;
+typedef SDG::Point_2       Point_2;
+typedef SDG::Face_handle   Face_handle;
+typedef SDG::Vertex_handle Vertex_handle;
+typedef SDG::Edge          Edge;
+typedef SDG::Site_2        Site_2;
 
 typedef Gt::Line_2    Line_2;
 typedef Gt::Segment_2 Segment_2;
@@ -126,6 +128,35 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
   }
 
   // --- Voronoi edges: the dual of each finite Delaunay edge. ---
+  // A Voronoi edge is the bisector of the two sites sitting across it; those are
+  // the ccw/cw vertices of the Delaunay edge. We report each so callers can,
+  // e.g., drop bisectors defined by a reflex vertex when extracting a medial axis.
+  auto describe_site = [&](Vertex_handle v) {
+    emscripten::val s = emscripten::val::object();
+    if (sdg.is_infinite(v)) {
+      s.set("type", std::string("infinite"));
+      s.set("source", emscripten::val::null());
+      return s;
+    }
+    const Site_2 site = v->site();
+    if (site.is_point()) {
+      s.set("type", std::string("point"));
+      auto hit = inputIndex.find(site.point());
+      if (hit != inputIndex.end()) {
+        emscripten::val src = emscripten::val::object();
+        src.set("polygon", hit->second.first);
+        src.set("vertex", hit->second.second);
+        s.set("source", src);
+      } else {
+        s.set("source", emscripten::val::null());  // e.g. a segment-intersection point
+      }
+    } else {
+      s.set("type", std::string("segment"));
+      s.set("source", emscripten::val::null());
+    }
+    return s;
+  };
+
   emscripten::val edges = emscripten::val::array();
   int eIdx = 0;
   for (auto eit = sdg.finite_edges_begin(); eit != sdg.finite_edges_end(); ++eit) {
@@ -138,6 +169,11 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     auto i2 = faceIndex.find(f2);
     edge.set("from", sdg.is_infinite(f1) || i1 == faceIndex.end() ? -1 : i1->second);
     edge.set("to",   sdg.is_infinite(f2) || i2 == faceIndex.end() ? -1 : i2->second);
+
+    emscripten::val sites = emscripten::val::array();
+    sites.set(0, describe_site(e.first->vertex(sdg.ccw(e.second))));
+    sites.set(1, describe_site(e.first->vertex(sdg.cw(e.second))));
+    edge.set("sites", sites);
 
     CGAL::Object o = sdg.primal(e);
 

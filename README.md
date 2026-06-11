@@ -4,7 +4,7 @@
 
 The segment **Voro**noi diagram of polygons, computed by [CGAL](https://www.cgal.org/) and shipped as WebAssembly.
 
-**[Live demo →](https://matthewjacobson.github.io/voron8/)**
+**[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)** · **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive))
 
 Give it an array of polygons; get back a graph of Voronoi vertices and edges where:
 
@@ -22,7 +22,7 @@ npm install voron8
 ## Usage
 
 ```js
-import { voronoi, tessellate } from "voron8";
+import { voronoi, medialAxis, tessellate } from "voron8";
 
 // One ring per polygon. Points may be {x, y} or [x, y]; rings auto-close.
 const square = [
@@ -38,11 +38,11 @@ for (const v of vertices) {
   }
 }
 
-// The interior edges are the medial axis of the shape.
-const medialAxis = edges.filter((e) => e.location === "interior");
+// The medial axis (interior skeleton) of the shape.
+const skeleton = await medialAxis(square);
 
 // Turn any edge — straight, ray, or curved parabolic arc — into a polyline.
-for (const e of medialAxis) {
+for (const e of skeleton.edges) {
   const polyline = tessellate(e.geometry, { parabolaSamples: 24 });
   draw(polyline);
 }
@@ -80,7 +80,13 @@ interface VoronoiEdge {
   from: number;   // index into vertices, or -1 if this endpoint is at infinity
   to: number;     // index into vertices, or -1 if this endpoint is at infinity
   location: "interior" | "exterior";
+  sites: [SiteRef, SiteRef];  // the two input sites this edge bisects
   geometry: EdgeGeometry;
+}
+
+interface SiteRef {
+  type: "point" | "segment" | "infinite";
+  source: { polygon: number; vertex: number } | null; // set for input corners
 }
 ```
 
@@ -103,6 +109,16 @@ tessellate(geom: EdgeGeometry, options?: {
 ```
 
 Returns a polyline. Straight edges return their two endpoints; parabolic arcs are sampled exactly along the curve; rays and lines are extruded to a finite length.
+
+### Medial axis
+
+```ts
+medialAxis(polygons: Polygon[]): Promise<VoronoiResult>;
+```
+
+The interior **medial axis** (skeleton) of the filled region. It is the subset of interior Voronoi edges *minus* those whose bisector is defined in part by a reflex (concave) vertex — those edges form the spurious fan around a reflex corner rather than the skeleton itself ([per Richard's CGAL answer](https://stackoverflow.com/questions/69237154/how-do-you-get-the-medial-axis-of-a-multipolygon-using-cgal)). The result shares the same `vertices` as `voronoi()` (so `from`/`to` indices stay valid) with `edges` narrowed to the medial axis. Reflex vertices are detected per ring with hole/nesting awareness, so polygons-with-holes work.
+
+The interactive [medial-axis demo](https://matthewjacobson.github.io/voron8/example/medial-axis.html) runs this over shapes from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive).
 
 ## Why a polygon corner shows up as a Voronoi vertex
 

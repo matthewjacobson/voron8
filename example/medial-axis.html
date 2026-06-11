@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>voron8 — medial axis</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+      header { padding: 12px 16px; border-bottom: 1px solid #232733; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+      header h1 { margin: 0; font-size: 16px; }
+      a { color: #60a5fa; }
+      select { background: #1a1e27; color: #e6e6e6; border: 1px solid #343a48; border-radius: 6px; padding: 5px 8px; font: inherit; }
+      label { color: #9aa4b2; display: inline-flex; gap: 6px; align-items: center; }
+      .legend { color: #9aa4b2; display: flex; gap: 14px; flex-wrap: wrap; }
+      .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; }
+      .status { color: #9aa4b2; margin-left: auto; }
+      canvas { display: block; width: 100%; height: calc(100vh - 58px); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>voron8 — medial axis</h1>
+      <label>polygon <select id="pick"></select></label>
+      <label><input type="checkbox" id="showVoronoi" checked /> show pruned interior edges</label>
+      <div class="legend">
+        <span><span class="swatch" style="background:#3b82f6"></span>polygon</span>
+        <span><span class="swatch" style="background:#6b7280"></span>pruned (reflex) edges</span>
+        <span><span class="swatch" style="background:#22c55e"></span>medial axis</span>
+      </div>
+      <span class="status" id="status"></span>
+      <a href="./">Voronoi demo →</a>
+    </header>
+    <canvas id="c"></canvas>
+
+    <script type="module">
+      // Built bundle (run `npm run build`, then serve the repo and open /example/medial-axis.html).
+      import { voronoi, medialAxis, tessellate } from "../dist/voron8.js";
+
+      // Polygons from LingDong-/interesting-polygon-archive (JSON: a 3D array
+      // of contours -> vertices -> [x, y]; contour 0 is the outer ring, the
+      // rest are holes — exactly voron8's polygon input shape).
+      const ARCHIVE =
+        "https://raw.githubusercontent.com/LingDong-/interesting-polygon-archive/master/json/";
+      const NAMES = [
+        "skimage-horse", "matisse-icarus", "matisse-alga", "matisse-blue",
+        "matisse-nuit", "misc-discobolus", "misc-fu", "mapbox-dude",
+        "mapbox-building", "gray-embroidery", "held-1", "held-3", "held-7",
+        "held-12", "eberly-10", "eberly-14", "elgindy-1", "mei-2", "mei-3",
+        "mei-5", "meisters-3", "seidel-3", "toussaint-1a",
+      ];
+
+      const pick = document.getElementById("pick");
+      const showVoronoi = document.getElementById("showVoronoi");
+      const statusEl = document.getElementById("status");
+      for (const n of NAMES) {
+        const o = document.createElement("option");
+        o.value = o.textContent = n;
+        pick.appendChild(o);
+      }
+
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d");
+
+      let current = null; // { polygons, full, medial }
+
+      async function loadPolygon(name) {
+        statusEl.textContent = `loading ${name}…`;
+        const res = await fetch(ARCHIVE + name + ".json");
+        if (!res.ok) throw new Error(`fetch failed (${res.status})`);
+        // contours: number[][][] — already voron8's Polygon[] (rings of [x,y]).
+        const polygons = await res.json();
+        const [full, medial] = await Promise.all([
+          voronoi(polygons),
+          medialAxis(polygons),
+        ]);
+        current = { polygons, full, medial };
+        const nVerts = polygons.reduce((s, r) => s + r.length, 0);
+        statusEl.textContent = `${name}: ${nVerts} vertices, ${medial.edges.length} medial edges`;
+        resize();
+      }
+
+      // Fit the polygon bounding box into the canvas (image coords are Y-down,
+      // which maps directly to canvas, so no flip).
+      function makeProjector() {
+        let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+        for (const ring of current.polygons)
+          for (const [x, y] of ring) {
+            if (x < minx) minx = x; if (x > maxx) maxx = x;
+            if (y < miny) miny = y; if (y > maxy) maxy = y;
+          }
+        const pad = 24;
+        const w = canvas.clientWidth, h = canvas.clientHeight;
+        const scale = Math.min((w - 2 * pad) / (maxx - minx || 1), (h - 2 * pad) / (maxy - miny || 1));
+        const ox = (w - (maxx - minx) * scale) / 2;
+        const oy = (h - (maxy - miny) * scale) / 2;
+        return (x, y) => ({ x: ox + (x - minx) * scale, y: oy + (y - miny) * scale });
+      }
+
+      function polyline(pts, color, width) {
+        if (pts.length < 2) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+        if (!current) return;
+        const P = makeProjector();
+
+        // Filled polygon (even-odd so holes punch through).
+        ctx.beginPath();
+        for (const ring of current.polygons) {
+          ring.forEach(([x, y], i) => {
+            const p = P(x, y);
+            i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y);
+          });
+          ctx.closePath();
+        }
+        ctx.fillStyle = "rgba(59,130,246,0.12)";
+        ctx.fill("evenodd");
+        ctx.strokeStyle = "#3b82f6";
+        ctx.lineWidth = 1.25;
+        ctx.stroke();
+
+        // Pruned interior edges (interior edges that the medial axis drops).
+        if (showVoronoi.checked) {
+          for (const e of current.full.edges) {
+            if (e.location !== "interior") continue;
+            polyline(tessellate(e.geometry, { parabolaSamples: 20 }).map((p) => P(p.x, p.y)), "#4b5563", 1);
+          }
+        }
+
+        // Medial axis on top.
+        for (const e of current.medial.edges) {
+          polyline(tessellate(e.geometry, { parabolaSamples: 24 }).map((p) => P(p.x, p.y)), "#22c55e", 2);
+        }
+      }
+
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * dpr;
+        canvas.height = canvas.clientHeight * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        draw();
+      }
+
+      window.addEventListener("resize", resize);
+      showVoronoi.addEventListener("change", draw);
+      pick.addEventListener("change", () =>
+        loadPolygon(pick.value).catch((e) => (statusEl.textContent = "error: " + e.message)),
+      );
+
+      loadPolygon(pick.value).catch((e) => (statusEl.textContent = "error: " + e.message));
+    </script>
+  </body>
+</html>

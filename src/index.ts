@@ -65,6 +65,17 @@ export type EdgeGeometry =
   | LineGeometry
   | ParabolaGeometry;
 
+/**
+ * One of the two input sites whose bisector an edge is. A `point` site carries
+ * its `{ polygon, vertex }` source when it is an original polygon corner (null
+ * for e.g. a segment-intersection point); `segment` and `infinite` sites have a
+ * null source.
+ */
+export interface SiteRef {
+  type: "point" | "segment" | "infinite";
+  source: { polygon: number; vertex: number } | null;
+}
+
 export interface VoronoiEdge {
   /** Index into `vertices` of one endpoint, or -1 if that endpoint is at infinity. */
   from: number;
@@ -72,6 +83,8 @@ export interface VoronoiEdge {
   to: number;
   /** Position relative to the even-odd filled input region. */
   location: "interior" | "exterior";
+  /** The two sites this edge bisects. */
+  sites: [SiteRef, SiteRef];
   geometry: EdgeGeometry;
 }
 
@@ -83,7 +96,7 @@ export interface VoronoiResult {
 type WasmModule = {
   computeVoronoi: (coords: number[], ringSizes: number[]) => {
     vertices: VoronoiVertex[];
-    edges: any[];
+    edges: Array<{ sites: [SiteRef, SiteRef] } & Record<string, any>>;
   };
 };
 
@@ -102,6 +115,10 @@ export function init(): Promise<WasmModule> {
 
 function toXY(p: Point | [number, number]): [number, number] {
   return Array.isArray(p) ? [p[0], p[1]] : [p.x, p.y];
+}
+
+function toRing(poly: Polygon): Array<[number, number]> {
+  return (poly as Array<Point | [number, number]>).map(toXY);
 }
 
 /**
@@ -126,6 +143,68 @@ function insideFilledRegion(
     }
   }
   return inside;
+}
+
+/** Shoelace signed area; sign encodes the ring's winding direction. */
+function ringSignedArea(ring: Array<[number, number]>): number {
+  let a = 0;
+  for (let i = 0, n = ring.length, j = n - 1; i < n; j = i++) {
+    a += ring[j][0] * ring[i][1] - ring[i][0] * ring[j][1];
+  }
+  return a / 2;
+}
+
+/** Ray-cast point-in-ring test for a single ring. */
+function pointInRing(
+  px: number,
+  py: number,
+  ring: Array<[number, number]>,
+): boolean {
+  let inside = false;
+  for (let i = 0, n = ring.length, j = n - 1; i < n; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    if (
+      yi > py !== yj > py &&
+      px < ((xj - xi) * (py - yi)) / (yj - yi) + xi
+    ) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * Keys ("polygon:vertex") of reflex (concave) vertices w.r.t. the filled solid.
+ * A vertex is reflex when the solid occupies more than 180° there. Works for any
+ * input winding and for holes: a ring's nesting depth (how many other rings
+ * contain it) decides whether the solid is on its inside (outer-like, even
+ * depth) or outside (hole-like, odd depth), and the turn direction relative to
+ * that orientation gives convex vs reflex.
+ */
+function reflexVertices(rings: Array<Array<[number, number]>>): Set<string> {
+  const reflex = new Set<string>();
+  rings.forEach((ring, p) => {
+    const n = ring.length;
+    if (n < 3) return;
+    const areaSign = ringSignedArea(ring) >= 0 ? 1 : -1;
+
+    let depth = 0;
+    rings.forEach((other, q) => {
+      if (q !== p && pointInRing(ring[0][0], ring[0][1], other)) depth++;
+    });
+    const want = depth % 2 === 0 ? 1 : -1; // outer-like vs hole-like
+
+    for (let i = 0; i < n; i++) {
+      const [px, py] = ring[(i - 1 + n) % n];
+      const [cx, cy] = ring[i];
+      const [nx, ny] = ring[(i + 1) % n];
+      const cross = (cx - px) * (ny - cy) - (cy - py) * (nx - cx);
+      const turn = cross > 0 ? 1 : cross < 0 ? -1 : 0;
+      if (turn * areaSign * want < 0) reflex.add(`${p}:${i}`);
+    }
+  });
+  return reflex;
 }
 
 /** Representative interior point used to classify a bounded edge. */
@@ -156,17 +235,11 @@ export async function voronoi(polygons: Polygon[]): Promise<VoronoiResult> {
 
   const coords: number[] = [];
   const ringSizes: number[] = [];
-  const rings: Array<Array<[number, number]>> = [];
+  const rings = polygons.map(toRing);
 
-  for (const poly of polygons) {
-    const ring: Array<[number, number]> = [];
-    for (const pt of poly as Array<Point | [number, number]>) {
-      const [x, y] = toXY(pt);
-      coords.push(x, y);
-      ring.push([x, y]);
-    }
+  for (const ring of rings) {
+    for (const [x, y] of ring) coords.push(x, y);
     ringSizes.push(ring.length);
-    rings.push(ring);
   }
 
   const raw = mod.computeVoronoi(coords, ringSizes);
@@ -202,10 +275,40 @@ export async function voronoi(polygons: Polygon[]): Promise<VoronoiResult> {
         ? "interior"
         : "exterior";
 
-    return { from: e.from, to: e.to, location, geometry };
+    return { from: e.from, to: e.to, location, sites: e.sites, geometry };
   });
 
   return { vertices: raw.vertices, edges };
+}
+
+/**
+ * The interior medial axis of the filled input region.
+ *
+ * The medial axis is the subset of interior Voronoi edges *excluding* those
+ * whose bisector is defined (in part) by a reflex/concave vertex — those edges
+ * form the spurious fan around a reflex corner rather than the skeleton itself.
+ * The genuine branch reaching a reflex corner survives, because it is the
+ * bisector of the two edges meeting there (two segment sites, no point site).
+ *
+ * Returns the same `vertices` as `voronoi()` (so edge `from`/`to` indices stay
+ * valid) with `edges` narrowed to the medial axis.
+ *
+ * @see https://stackoverflow.com/questions/69237154 (Richard's CGAL answer)
+ */
+export async function medialAxis(polygons: Polygon[]): Promise<VoronoiResult> {
+  const result = await voronoi(polygons);
+  const reflex = reflexVertices(polygons.map(toRing));
+
+  const definedByReflex = (s: SiteRef) =>
+    s.type === "point" &&
+    s.source !== null &&
+    reflex.has(`${s.source.polygon}:${s.source.vertex}`);
+
+  const edges = result.edges.filter(
+    (e) => e.location === "interior" && !e.sites.some(definedByReflex),
+  );
+
+  return { vertices: result.vertices, edges };
 }
 
 export interface TessellateOptions {
