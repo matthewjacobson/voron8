@@ -1,14 +1,21 @@
-// Feature pruning for a voron8 medial axis.
+// Feature pruning for a voron8 medial axis, following the rooted-tree model of
+// micycle1's PGS / boneyard MedialAxis (getPrunedEdges):
+// https://github.com/micycle1/PGS/blob/8231057/src/main/java/micycle/pgs/PGS_Contour.java
 //
-// The medial axis is a graph; insignificant features show up as short leaf
-// branches (a path from a degree-1 leaf to the next junction). We iteratively
-// collapse leaf branches whose significance is below a threshold, under one of
-// three measures:
+// The medial axis is rooted at its widest point (largest inscribed disk) and
+// turned into a tree. Three normalized 0..1 measures prune it, each cutting an
+// edge AND its whole subtree at the first failing node:
 //
-//   "length" — total branch length            (remove features shorter than t)
-//   "area"   — ribbon area ≈ Σ length × radius (remove features smaller than t)
-//   "angle"  — corner sharpness at the leaf,   (remove branches off nearly-flat
-//              i.e. 180° − interior angle        corners, keep sharp features)
+//   axial    — per-edge axial gradient d(radius)/d(length). Pruning raises the
+//              kept-floor from the min gradient toward the max, removing the
+//              steeply tapering tips first.
+//   distance — geodesic distance from the root to the edge's far end. Pruning
+//              lowers the kept-ceiling from the furthest disk toward the root.
+//   area     — feature area of the edge's subtree (Σ ribbon area of descendants).
+//              Pruning raises the kept-floor toward the whole-shape area.
+//
+// Thresholds map exactly as PGS does: axial/area are cubed (t³) before mapping;
+// distance maps as furthest·(1−t). 0 = no pruning, 1 = maximum pruning.
 //
 // Pure, DOM-free, and unit-tested in test/prune.test.mjs.
 
@@ -16,7 +23,6 @@ function xy(p) {
   return Array.isArray(p) ? [p[0], p[1]] : [p.x, p.y];
 }
 
-// Distance from point (px,py) to segment (ax,ay)-(bx,by).
 function pointSegDistance(px, py, ax, ay, bx, by) {
   const dx = bx - ax, dy = by - ay;
   const len2 = dx * dx + dy * dy;
@@ -38,32 +44,15 @@ function boundarySegments(polygons) {
   return segs;
 }
 
-// 180° − interior angle at the polygon corner a medial leaf sits on. Larger =
-// sharper, more significant feature. Infinity when the vertex isn't an input
-// corner (so junction nodes exposed by pruning are never pruned by angle).
-function cornerSharpness(vertex, polygons) {
-  if (!vertex || !vertex.source) return Infinity;
-  const ring = polygons[vertex.source.polygon];
-  const n = ring.length;
-  const k = vertex.source.vertex;
-  const c = xy(ring[k]);
-  const p = xy(ring[(k - 1 + n) % n]);
-  const q = xy(ring[(k + 1) % n]);
-  const a = [p[0] - c[0], p[1] - c[1]];
-  const b = [q[0] - c[0], q[1] - c[1]];
-  const na = Math.hypot(a[0], a[1]);
-  const nb = Math.hypot(b[0], b[1]);
-  if (!na || !nb) return Infinity;
-  const cos = Math.max(-1, Math.min(1, (a[0] * b[0] + a[1] * b[1]) / (na * nb)));
-  return 180 - (Math.acos(cos) * 180) / Math.PI;
-}
+const clamp01 = (t) => Math.min(1, Math.max(0, t));
 
 /**
- * Precompute per-edge length and ribbon area, and per-vertex corner sharpness.
- * These depend only on geometry, so a slider can re-`prune()` without redoing
- * them. `tessellate` is voron8's tessellate (injected to keep this standalone).
+ * Build the rooted medial-axis tree and per-edge/per-node metrics. Geometry-only,
+ * so a slider can re-`pruneTree()` cheaply without rebuilding. `tessellate` is
+ * voron8's tessellate (injected to keep this module standalone).
  */
-export function precomputeMetrics(medial, polygons, tessellate, parabolaSamples = 16) {
+export function buildMedialTree(medial, polygons, tessellate, parabolaSamples = 24) {
+  const edges = medial.edges;
   const segs = boundarySegments(polygons);
   const radiusAt = (x, y) => {
     let m = Infinity;
@@ -74,9 +63,23 @@ export function precomputeMetrics(medial, polygons, tessellate, parabolaSamples 
     return m;
   };
 
-  const lenOf = new Array(medial.edges.length).fill(0);
-  const areaOf = new Array(medial.edges.length).fill(0);
-  medial.edges.forEach((e, i) => {
+  // Inscribed radius (clearance) at every medial vertex an edge touches.
+  const radius = new Map();
+  const note = (n) => {
+    if (n >= 0 && !radius.has(n)) {
+      const v = medial.vertices[n];
+      radius.set(n, radiusAt(v.x, v.y));
+    }
+  };
+  edges.forEach((e) => {
+    if (e.from >= 0 && e.to >= 0) { note(e.from); note(e.to); }
+  });
+
+  // Per-edge length and a ribbon-area proxy (length × average clearance) standing
+  // in for PGS's Delaunay-triangle area.
+  const edgeLen = new Array(edges.length).fill(0);
+  const edgeArea = new Array(edges.length).fill(0);
+  edges.forEach((e, i) => {
     if (e.from < 0 || e.to < 0) return;
     const poly = tessellate(e.geometry, { parabolaSamples });
     let L = 0;
@@ -86,86 +89,136 @@ export function precomputeMetrics(medial, polygons, tessellate, parabolaSamples 
     let r = 0;
     for (const p of poly) r += radiusAt(p.x, p.y);
     r = poly.length ? r / poly.length : 0;
-    lenOf[i] = L;
-    areaOf[i] = L * r;
+    edgeLen[i] = L;
+    edgeArea[i] = L * r;
   });
 
-  const sharpnessOf = new Map();
-  medial.vertices.forEach((v, node) => sharpnessOf.set(node, cornerSharpness(v, polygons)));
-
-  return { lenOf, areaOf, sharpnessOf };
-}
-
-function buildAdjacency(edges, alive) {
+  // Adjacency over bounded edges.
   const adj = new Map();
   const add = (n, e, o) => {
     if (!adj.has(n)) adj.set(n, []);
     adj.get(n).push({ e, o });
   };
-  edges.forEach((ed, i) => {
-    if (!alive[i] || ed.from < 0 || ed.to < 0) return;
-    add(ed.from, i, ed.to);
-    add(ed.to, i, ed.from);
+  edges.forEach((e, i) => {
+    if (e.from < 0 || e.to < 0) return;
+    add(e.from, i, e.to);
+    add(e.to, i, e.from);
   });
-  return adj;
-}
 
-// Walk from a leaf through degree-2 nodes to the next leaf or junction,
-// collecting the edges of that branch.
-function traceBranch(leaf, adj) {
-  const edges = [];
-  let node = leaf;
-  let fromEdge = -1;
-  while (true) {
-    const nbrs = adj.get(node) || [];
-    if (node !== leaf && nbrs.length !== 2) break; // reached a junction or leaf
-    let next = null;
-    for (const nb of nbrs) {
-      if (nb.e !== fromEdge) { next = nb; break; }
-    }
-    if (!next) break;
-    edges.push(next.e);
-    fromEdge = next.e;
-    node = next.o;
-    if (node === leaf) break; // pure-cycle guard (shouldn't happen from a leaf)
-  }
-  return { edges, terminal: node };
-}
+  // Forest BFS: root each connected component at its widest disk (max radius),
+  // mirroring PGS's "largest inscribed disk" root. Geodesic distance accumulates
+  // edge lengths from the root.
+  const parentEdge = new Map();
+  const children = new Map();
+  const distance = new Map();
+  const visited = new Set();
+  const roots = [];
+  const byRadiusDesc = [...radius.keys()].sort((a, b) => radius.get(b) - radius.get(a));
 
-/**
- * Return a boolean array (per medial edge) of which edges survive pruning at
- * `threshold` under `mode` ("none" | "length" | "area" | "angle"). Cycles (e.g.
- * around holes) have no leaves and are never pruned.
- */
-export function prune(medial, metrics, mode, threshold) {
-  const edges = medial.edges;
-  const alive = edges.map((e) => e.from >= 0 && e.to >= 0);
-  if (mode === "none" || !(threshold > 0)) return alive;
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    const adj = buildAdjacency(edges, alive);
-    const leaves = [];
-    for (const [node, nbrs] of adj) if (nbrs.length === 1) leaves.push(node);
-
-    for (const leaf of leaves) {
-      const nbrs = adj.get(leaf);
-      if (!nbrs || nbrs.length !== 1) continue; // degree changed earlier this pass
-      const branch = traceBranch(leaf, adj);
-      if (!branch.edges.length || branch.edges.some((ei) => !alive[ei])) continue;
-
-      let sig;
-      if (mode === "length") sig = branch.edges.reduce((s, ei) => s + metrics.lenOf[ei], 0);
-      else if (mode === "area") sig = branch.edges.reduce((s, ei) => s + metrics.areaOf[ei], 0);
-      else if (mode === "angle") sig = metrics.sharpnessOf.get(leaf) ?? Infinity;
-      else sig = Infinity;
-
-      if (sig < threshold) {
-        branch.edges.forEach((ei) => (alive[ei] = false));
-        changed = true;
+  for (const start of byRadiusDesc) {
+    if (visited.has(start)) continue;
+    roots.push(start);
+    visited.add(start);
+    distance.set(start, 0);
+    if (!children.has(start)) children.set(start, []);
+    const queue = [start];
+    while (queue.length) {
+      const u = queue.shift();
+      for (const { e, o } of adj.get(u) || []) {
+        if (visited.has(o)) continue;
+        visited.add(o);
+        parentEdge.set(o, e);
+        distance.set(o, distance.get(u) + edgeLen[e]);
+        children.get(u).push({ edge: e, child: o });
+        if (!children.has(o)) children.set(o, []);
+        queue.push(o);
       }
     }
   }
+
+  // Axial gradient of each tree edge (attributed to its far/child node).
+  const axialGradient = new Map();
+  let minGrad = Infinity, maxGrad = -Infinity;
+  for (const [child, e] of parentEdge) {
+    const u = edges[e].from === child ? edges[e].to : edges[e].from;
+    const g = edgeLen[e] ? (radius.get(child) - radius.get(u)) / edgeLen[e] : 0;
+    axialGradient.set(child, g);
+    if (g < minGrad) minGrad = g;
+    if (g > maxGrad) maxGrad = g;
+  }
+  if (!isFinite(minGrad)) { minGrad = 0; maxGrad = 0; }
+
+  // Feature area: subtree sum of node areas (a node's area is its parent edge's
+  // ribbon area; the root contributes 0). Post-order over each rooted tree.
+  const featureArea = new Map();
+  const nodeArea = (n) => (parentEdge.has(n) ? edgeArea[parentEdge.get(n)] : 0);
+  for (const root of roots) {
+    const order = [];
+    const stack = [root];
+    while (stack.length) {
+      const u = stack.pop();
+      order.push(u);
+      for (const { child } of children.get(u) || []) stack.push(child);
+    }
+    for (let i = order.length - 1; i >= 0; i--) {
+      const u = order[i];
+      let a = nodeArea(u);
+      for (const { child } of children.get(u) || []) a += featureArea.get(child);
+      featureArea.set(u, a);
+    }
+  }
+
+  const furthestDistance = distance.size ? Math.max(...distance.values()) : 0;
+  const totalArea = roots.reduce((s, r) => s + (featureArea.get(r) || 0), 0);
+  const treeEdges = new Set(parentEdge.values());
+
+  return {
+    edges, edgeLen, edgeArea, radius, parentEdge, children, distance,
+    axialGradient, featureArea, roots, treeEdges,
+    minGrad, maxGrad, furthestDistance, totalArea,
+  };
+}
+
+/**
+ * Boolean array (per medial edge) of which edges survive pruning at the three
+ * normalized 0..1 thresholds, using PGS's mapping and root-down subtree cutoff.
+ * Edges closing a cycle (e.g. around a hole) aren't tree edges; they survive iff
+ * both endpoints survive.
+ */
+export function pruneTree(tree, axialThreshold, distanceThreshold, areaThreshold) {
+  const a = clamp01(axialThreshold);
+  const mappedAxial = tree.minGrad + (tree.maxGrad - tree.minGrad) * (a * a * a);
+  const mappedDistance = tree.furthestDistance * (1 - clamp01(distanceThreshold));
+  const ar = clamp01(areaThreshold);
+  const mappedArea = ar * ar * ar * tree.totalArea;
+
+  const alive = tree.edges.map(() => false);
+  const aliveNode = new Set();
+
+  for (const root of tree.roots) {
+    aliveNode.add(root);
+    const stack = [root];
+    while (stack.length) {
+      const u = stack.pop();
+      for (const { edge, child } of tree.children.get(u) || []) {
+        const keep =
+          tree.axialGradient.get(child) >= mappedAxial &&
+          tree.distance.get(child) <= mappedDistance &&
+          tree.featureArea.get(child) >= mappedArea;
+        if (keep) {
+          alive[edge] = true;
+          aliveNode.add(child);
+          stack.push(child);
+        }
+      }
+    }
+  }
+
+  // Non-tree (cycle-closing) edges survive when both endpoints survived.
+  tree.edges.forEach((e, i) => {
+    if (alive[i] || e.from < 0 || e.to < 0 || tree.treeEdges.has(i)) return;
+    if (aliveNode.has(e.from) && aliveNode.has(e.to)) alive[i] = true;
+  });
+
   return alive;
 }

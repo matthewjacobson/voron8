@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { medialAxis, tessellate } from "../dist/voron8.js";
-import { precomputeMetrics, prune } from "../example/prune.js";
+import { buildMedialTree, pruneTree } from "../example/prune.js";
 
 // A rectangle with four short spikes off the top edge — small features that
 // pruning should remove before the main horizontal spine.
@@ -22,58 +22,83 @@ const L_SHAPE = [
 
 async function setup(polygons) {
   const medial = await medialAxis(polygons);
-  const metrics = precomputeMetrics(medial, polygons, tessellate, 16);
-  const count = (mode, t) => prune(medial, metrics, mode, t).filter(Boolean).length;
-  return { medial, metrics, count };
+  const tree = buildMedialTree(medial, polygons, tessellate, 24);
+  const boundedCount = medial.edges.filter((e) => e.from >= 0 && e.to >= 0).length;
+  const keep = (a, d, ar) => pruneTree(tree, a, d, ar).filter(Boolean).length;
+  return { medial, tree, boundedCount, keep };
 }
 
-test("mode 'none' keeps every medial edge", async () => {
-  const { medial, count } = await setup(COMB);
-  assert.equal(count("none", 0), medial.edges.length);
-  assert.equal(count("length", 0), medial.edges.length, "threshold 0 prunes nothing");
+test("all-zero thresholds keep every bounded edge", async () => {
+  const { boundedCount, keep } = await setup(COMB);
+  assert.equal(keep(0, 0, 0), boundedCount);
 });
 
-test("length pruning is monotonic and prunes progressively", async () => {
-  const { medial, count } = await setup(COMB);
-  const full = medial.edges.length;
-  const seq = [0, 20, 40, 60].map((t) => count("length", t));
-  assert.equal(seq[0], full, "threshold 0 prunes nothing");
-  for (let i = 1; i < seq.length; i++) {
-    assert.ok(seq[i] <= seq[i - 1], "larger threshold keeps fewer-or-equal edges");
+test("the tree is rooted at the widest disk", async () => {
+  const { tree } = await setup(COMB);
+  assert.ok(tree.roots.length >= 1);
+  const maxR = Math.max(...tree.radius.values());
+  for (const root of tree.roots) {
+    // each component root has distance 0 and the max radius among reachable nodes
+    assert.equal(tree.distance.get(root), 0);
   }
-  assert.ok(seq.some((c) => c > 0 && c < full), "some threshold partially prunes");
-  assert.equal(count("length", 1e6), 0, "a huge threshold removes everything");
+  // The global widest disk is a root.
+  const widest = [...tree.radius.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  assert.ok(tree.roots.includes(widest));
+  assert.ok(maxR > 0);
 });
 
-test("area pruning is monotonic", async () => {
-  const { count } = await setup(COMB);
-  let prev = Infinity;
-  for (const t of [0, 10, 50, 200, 1000]) {
-    const c = count("area", t);
-    assert.ok(c <= prev, `area kept-count non-increasing at t=${t}`);
-    prev = c;
+test("each threshold prunes monotonically and 1 removes (almost) everything", async () => {
+  const { boundedCount, keep } = await setup(COMB);
+  for (const axis of [0, 1, 2]) { // axial, distance, area
+    let prev = Infinity;
+    for (const t of [0, 0.2, 0.4, 0.7, 1]) {
+      const args = [0, 0, 0];
+      args[axis] = t;
+      const c = keep(...args);
+      assert.ok(c <= prev, `measure ${axis} non-increasing at t=${t} (${c} > ${prev})`);
+      prev = c;
+    }
+    const args = [0, 0, 0];
+    args[axis] = 1;
+    assert.ok(keep(...args) < boundedCount, `measure ${axis}=1 prunes`);
   }
 });
 
-test("angle pruning removes branches off the flattest corners first", async () => {
-  // Spike tips (~20° corner -> ~160° sharpness) are very sharp; the rectangle's
-  // 90° corners are less sharp (90° sharpness). A threshold between the two
-  // keeps the spikes and trims the rectangle-corner branches.
-  const { count } = await setup(COMB);
-  const full = count("angle", 0);
-  const mid = count("angle", 100); // 90° corners (sharpness 90) pruned, spikes (160) kept
-  assert.ok(mid < full, "some branches pruned at 100°");
-  assert.ok(mid > 0, "sharp spikes survive");
-  // Monotonic.
-  assert.ok(count("angle", 170) <= mid);
-});
-
-test("pruning never resurrects edges and respects the graph", async () => {
-  const { medial, metrics } = await setup(L_SHAPE);
-  const alive = prune(medial, metrics, "length", 1.5);
-  // Kept edges are a subset of the bounded medial edges.
-  alive.forEach((a, i) => {
-    if (a) assert.ok(medial.edges[i].from >= 0 && medial.edges[i].to >= 0);
+test("distance pruning removes the periphery, keeping a connected core at the root", async () => {
+  const { tree, keep, boundedCount } = await setup(COMB);
+  // A mid distance threshold keeps fewer edges but not zero.
+  const mid = keep(0, 0.5, 0);
+  assert.ok(mid > 0 && mid < boundedCount);
+  // Every kept tree edge is within the mapped distance of the root.
+  const alive = pruneTree(tree, 0, 0.5, 0);
+  const ceiling = tree.furthestDistance * 0.5;
+  tree.edges.forEach((e, i) => {
+    if (alive[i] && tree.treeEdges.has(i)) {
+      const child = tree.parentEdge.get(e.from) === i ? e.from : e.to;
+      assert.ok(tree.distance.get(child) <= ceiling + 1e-9);
+    }
   });
-  assert.ok(alive.filter(Boolean).length < medial.edges.length);
+});
+
+test("axial pruning keeps shallow-gradient edges and drops steep tapers", async () => {
+  const { tree } = await setup(COMB);
+  const alive = pruneTree(tree, 0.5, 0, 0);
+  const a = 0.5 ** 3;
+  const floor = tree.minGrad + (tree.maxGrad - tree.minGrad) * a;
+  tree.edges.forEach((e, i) => {
+    if (alive[i] && tree.treeEdges.has(i)) {
+      const child = tree.parentEdge.get(e.from) === i ? e.from : e.to;
+      assert.ok(tree.axialGradient.get(child) >= floor - 1e-9);
+    }
+  });
+});
+
+test("works on a real archived polygon (mapbox-building)", async () => {
+  const url =
+    "https://raw.githubusercontent.com/LingDong-/interesting-polygon-archive/master/json/mapbox-building.json";
+  const polygons = await (await fetch(url)).json();
+  const { boundedCount, keep } = await setup(polygons);
+  assert.equal(keep(0, 0, 0), boundedCount);
+  assert.ok(keep(0.3, 0.3, 0.3) < boundedCount);
+  assert.ok(keep(0.3, 0.3, 0.3) > 0);
 });

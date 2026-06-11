@@ -21,17 +21,12 @@
     <header>
       <h1>voron8 — medial axis</h1>
       <label>polygon <select id="pick"></select></label>
-      <label>prune by
-        <select id="mode">
-          <option value="none">none</option>
-          <option value="length">branch length (distance)</option>
-          <option value="area">branch area</option>
-          <option value="angle">corner sharpness (axial angle)</option>
-        </select>
-      </label>
-      <label><input type="range" id="thresh" min="0" max="100" value="0" step="1" disabled />
-        <span id="threshVal" style="min-width:5ch">—</span>
-      </label>
+      <label>axial <input type="range" id="axial" min="0" max="1" value="0" step="0.01" />
+        <span id="axialVal" style="min-width:3ch">0</span></label>
+      <label>distance <input type="range" id="distance" min="0" max="1" value="0" step="0.01" />
+        <span id="distanceVal" style="min-width:3ch">0</span></label>
+      <label>area <input type="range" id="area" min="0" max="1" value="0" step="0.01" />
+        <span id="areaVal" style="min-width:3ch">0</span></label>
       <div class="legend">
         <span><span class="swatch" style="background:#3b82f6"></span>polygon</span>
         <span><span class="swatch" style="background:#374151"></span>pruned interior</span>
@@ -46,7 +41,7 @@
     <script type="module">
       // Built bundle (run `npm run build`, then serve the repo and open /example/medial-axis.html).
       import { voronoi, medialAxis, tessellate } from "../dist/voron8.js";
-      import { precomputeMetrics, prune } from "./prune.js";
+      import { buildMedialTree, pruneTree } from "./prune.js";
 
       // Polygons from LingDong-/interesting-polygon-archive (JSON: a 3D array
       // of contours -> vertices -> [x, y]; contour 0 is the outer ring, the
@@ -62,9 +57,16 @@
       ];
 
       const pick = document.getElementById("pick");
-      const mode = document.getElementById("mode");
-      const thresh = document.getElementById("thresh");
-      const threshVal = document.getElementById("threshVal");
+      const sliders = {
+        axial: document.getElementById("axial"),
+        distance: document.getElementById("distance"),
+        area: document.getElementById("area"),
+      };
+      const vals = {
+        axial: document.getElementById("axialVal"),
+        distance: document.getElementById("distanceVal"),
+        area: document.getElementById("areaVal"),
+      };
       const statusEl = document.getElementById("status");
       for (const n of NAMES) {
         const o = document.createElement("option");
@@ -75,7 +77,7 @@
       const canvas = document.getElementById("c");
       const ctx = canvas.getContext("2d");
 
-      let current = null; // { polygons, full, medial, metrics, bbox, alive }
+      let current = null; // { polygons, full, medial, tree, bbox, alive }
 
       function bboxOf(polygons) {
         let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
@@ -84,7 +86,7 @@
             if (x < minx) minx = x; if (x > maxx) maxx = x;
             if (y < miny) miny = y; if (y > maxy) maxy = y;
           }
-        return { minx, miny, maxx, maxy, diag: Math.hypot(maxx - minx, maxy - miny) };
+        return { minx, miny, maxx, maxy };
       }
 
       async function loadPolygon(name) {
@@ -97,42 +99,22 @@
           voronoi(polygons),
           medialAxis(polygons),
         ]);
-        const metrics = precomputeMetrics(medial, polygons, tessellate, 24);
-        current = { polygons, full, medial, metrics, bbox: bboxOf(polygons), alive: null };
-        configureSlider();
+        // Rooted-tree pruning metrics (geometry-only; cheap to re-prune per slider).
+        const tree = buildMedialTree(medial, polygons, tessellate, 24);
+        current = { polygons, full, medial, tree, bbox: bboxOf(polygons), alive: null };
         applyPrune();
         resize();
       }
 
-      // Set the slider's range to match the chosen measure and current shape.
-      function configureSlider() {
-        if (!current) return;
-        const off = mode.value === "none";
-        thresh.disabled = off;
-        const { diag, minx, miny, maxx, maxy } = current.bbox;
-        let max, step;
-        if (mode.value === "length") { max = 0.5 * diag; step = max / 400; }
-        else if (mode.value === "area") { max = 0.05 * (maxx - minx) * (maxy - miny); step = max / 400; }
-        else if (mode.value === "angle") { max = 180; step = 1; }
-        else { max = 100; step = 1; }
-        thresh.max = max;
-        thresh.step = step || 1;
-        thresh.value = 0;
-        updateThreshLabel();
-      }
-
-      function updateThreshLabel() {
-        if (mode.value === "none") { threshVal.textContent = "—"; return; }
-        const v = +thresh.value;
-        threshVal.textContent =
-          mode.value === "angle" ? `${v.toFixed(0)}°`
-          : mode.value === "area" ? v.toFixed(0)
-          : v.toFixed(1);
-      }
-
       function applyPrune() {
         if (!current) return;
-        current.alive = prune(current.medial, current.metrics, mode.value, +thresh.value);
+        for (const k of ["axial", "distance", "area"]) vals[k].textContent = (+sliders[k].value).toFixed(2);
+        current.alive = pruneTree(
+          current.tree,
+          +sliders.axial.value,
+          +sliders.distance.value,
+          +sliders.area.value,
+        );
         const kept = current.alive.filter(Boolean).length;
         const nVerts = current.polygons.reduce((s, r) => s + r.length, 0);
         statusEl.textContent =
@@ -207,8 +189,9 @@
       }
 
       window.addEventListener("resize", resize);
-      mode.addEventListener("change", () => { configureSlider(); applyPrune(); draw(); });
-      thresh.addEventListener("input", () => { updateThreshLabel(); applyPrune(); draw(); });
+      for (const k of ["axial", "distance", "area"]) {
+        sliders[k].addEventListener("input", () => { applyPrune(); draw(); });
+      }
       pick.addEventListener("change", () =>
         loadPolygon(pick.value).catch((e) => (statusEl.textContent = "error: " + e.message)),
       );
