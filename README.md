@@ -1,5 +1,7 @@
 # voron8
 
+[![CI](https://github.com/matthewjacobson/voron8/actions/workflows/ci.yml/badge.svg)](https://github.com/matthewjacobson/voron8/actions/workflows/ci.yml)
+
 The segment **Voro**noi diagram of polygons, computed by [CGAL](https://www.cgal.org/) and shipped as WebAssembly.
 
 Give it an array of polygons; get back a graph of Voronoi vertices and edges where:
