@@ -142,9 +142,13 @@ npm test
 
 Override header locations with `CGAL_INCLUDE_DIR` / `BOOST_INCLUDE_DIR` if they aren't in Homebrew's default prefix.
 
-### Why the exact kernel (and not CGAL's recommended filtered traits)
+### Why a filtered kernel on WASM (and how it stays sound)
 
-CGAL's own examples use filtered traits (`EPICK`/`EPECK`), which rely on interval arithmetic for speed. But interval arithmetic needs to switch the CPU's floating-point **rounding mode**, and **WebAssembly cannot set the rounding mode** — making those predicates unsound here. voron8 therefore uses a pure exact rational kernel, `Simple_cartesian<Quotient<MP_Float>>` with `Field_tag` traits: slower, but correct and deterministic in the browser. Insertion still uses CGAL's spatial-sorted `insert_segments`, which recovers much of the lost speed by improving locality.
+CGAL's filtered kernels (`EPICK`/`EPECK`) get their speed from interval arithmetic, which normally needs to switch the CPU's floating-point **rounding mode** to keep its bounds rigorous. **WebAssembly has no instruction to change the rounding mode** — every operation rounds to nearest — so a naive filtered kernel would be *unsound* here (occasional wrong predicate signs → wrong topology), which is why earlier versions of voron8 fell back to a slow pure-exact rational kernel.
+
+CGAL anticipates exactly this case with the **`CGAL_ALWAYS_ROUND_TO_NEAREST`** build flag: `Interval_nt` then computes in round-to-nearest and widens each bound outward by one ULP (`nextafter`), so the bounds stay rigorous — just slightly looser, costing a few extra exact fallbacks. With that flag (set in `scripts/build-wasm.sh`), voron8 uses CGAL's **`Segment_Delaunay_graph_filtered_traits_2`**: predicates resolve in fast double intervals and fall back to an exact GMP-free `Quotient<MP_Float>` kernel only on genuinely close cases.
+
+The result is **~50× faster** than the old pure-exact kernel (the compound-Voronoi example dropped from ~22 s to ~0.4 s) while producing **identical topology**. Constructions run in `double`, so Voronoi-vertex coordinates carry machine-epsilon error (~1e-14); input polygon corners still match exactly, so vertex/site provenance (`isInput`, `source`, `sites`) is preserved. Insertion still uses CGAL's spatial-sorted `insert_segments`.
 
 ## Releasing
 

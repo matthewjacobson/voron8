@@ -1,17 +1,27 @@
 // voron8 — CGAL Segment Voronoi diagram of polygons, compiled to WebAssembly.
 //
-// Kernel choice (see README "Why the exact kernel"): WebAssembly cannot set the
-// FPU rounding mode, which makes CGAL's interval-arithmetic filtered predicates
-// (EPICK/EPECK, the kernels CGAL's own examples recommend) unsound here. We use a
-// pure exact rational kernel instead — correct and deterministic on wasm, at the
-// cost of speed. Spatial sorting (built into insert_segments) recovers a lot of
-// that speed by improving insertion locality.
+// Kernel choice (see README "Why a filtered kernel on WASM"): WebAssembly has no
+// instruction to change the FPU rounding mode — every op rounds to nearest — so
+// CGAL's interval-arithmetic filter (Interval_nt, used by every filtered/lazy
+// kernel) would normally be UNSOUND here: it relies on directed rounding to make
+// its bounds rigorous. CGAL anticipates exactly this case with the
+// CGAL_ALWAYS_ROUND_TO_NEAREST build flag, which makes Interval_nt compute in
+// round-to-nearest and then widen each bound outward by one ULP (via nextafter).
+// The bounds stay rigorous, just slightly looser (a few more exact fallbacks).
+//
+// With that flag set (see scripts/build-wasm.sh) we use the *filtered* segment
+// Delaunay traits: predicates resolve in fast double intervals and fall back to an
+// exact Quotient<MP_Float> kernel (GMP-free) only on genuinely close cases. This is
+// ~50x faster than the previous pure-exact kernel while producing identical
+// topology; constructions are in double (machine-epsilon coordinate accuracy).
+// Input-corner coincidence still matches exactly because the dual of a corner face
+// is constructed as the corner point itself.
 
 #include <CGAL/Simple_cartesian.h>
 #include <CGAL/Quotient.h>
 #include <CGAL/MP_Float.h>
 #include <CGAL/Segment_Delaunay_graph_2.h>
-#include <CGAL/Segment_Delaunay_graph_traits_2.h>
+#include <CGAL/Segment_Delaunay_graph_filtered_traits_2.h>
 #include <CGAL/Parabola_segment_2.h>
 
 #include <emscripten/bind.h>
@@ -21,10 +31,12 @@
 #include <vector>
 #include <utility>
 
-typedef CGAL::Quotient<CGAL::MP_Float>                              NT;
-typedef CGAL::Simple_cartesian<NT>                                  K;
-// Non-filtered traits with Field_tag: no sqrt required, no interval arithmetic.
-typedef CGAL::Segment_Delaunay_graph_traits_2<K, CGAL::Field_tag>   Gt;
+// Construction kernel: double (fast, machine-epsilon coordinates). The filtered
+// traits supplies its own interval filter (FK) and exact fallback (EK defaults to
+// Simple_cartesian<Quotient<MP_Float>> under -DCGAL_DISABLE_GMP).
+typedef double                                                      NT;
+typedef CGAL::Simple_cartesian<double>                              CK;
+typedef CGAL::Segment_Delaunay_graph_filtered_traits_2<CK>          Gt;
 typedef CGAL::Segment_Delaunay_graph_2<Gt>                          SDG;
 
 typedef SDG::Point_2       Point_2;
