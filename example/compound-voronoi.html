@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>voron8 — Compound Voronoi (live, morphing)</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0f14; }
+      body { display: grid; place-items: center; }
+      canvas { background: #0b0f14; box-shadow: 0 0 60px #000 inset; border-radius: 6px; }
+      #hud {
+        position: fixed; top: 10px; left: 12px; margin: 0;
+        font: 12px/1.4 ui-monospace, Menlo, monospace; color: #5b6b7a;
+        pointer-events: none; white-space: pre;
+      }
+    </style>
+</head>
+<body>
+<canvas id="c" width="800" height="800"></canvas>
+<pre id="hud"></pre>
+<script type="module">
+  import { voronoi, tessellate } from "../dist/voron8.js";
+
+  const W = 800, H = 800;
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const hud = document.getElementById("hud");
+
+  // --- The polygon a site originates from, or null if unattributable. ---
+  const sitePolygon = (s) => {
+    if (s.type === "point")   return s.source ? s.source.polygon : null;
+    if (s.type === "segment") return s.segment?.[0]?.polygon ?? s.segment?.[1]?.polygon ?? null;
+    return null; // infinite
+  };
+  // True when an edge is the bisector between two *different* input polygons.
+  const separatesPolygons = (e) => {
+    const [a, b] = e.sites;
+    const pa = sitePolygon(a), pb = sitePolygon(b);
+    return pa !== null && pb !== null && pa !== pb;
+  };
+
+  // Seeded RNG so the scene is reproducible across reloads.
+  let seed = 0x9e3779b9 >>> 0;
+  const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+
+  // --- Soft-body blobs ----------------------------------------------------
+  // Each blob is a ring of point masses (in LOCAL space, centered on 0,0):
+  //   • edge springs  — between adjacent vertices; rest length & stiffness
+  //                     drift slowly over time → this is what morphs the shape.
+  //   • anchor springs — tether each vertex to a slowly-moving angular "slot"
+  //                     (radius * unit-angle). Keeps vertices angularly ordered
+  //                     so the ring stays a simple, non-self-intersecting polygon
+  //                     and can't collapse. Anchors are stiffer than edges.
+  // The blob's CENTER moves separately (drift / wall-bounce / mutual repulsion).
+  const N = 9;
+  const K_ANCHOR = 34;          // anchor stiffness — kept above peak edge stiffness
+                                // (14×1.55≈22) so anchors stay dominant → no self-intersection
+  const K_EDGE_BASE = 14;       // baseline edge stiffness
+  const DAMP = 0.98;            // per-substep velocity damping (high → loose, jelly-like wobble)
+  const SUBSTEPS = 6, H_STEP = 1 / 180;  // fixed soft-body timestep, decoupled from fps
+
+  const blobs = [];
+  for (let k = 0; k < N; k++) {
+    const sides = 9 + Math.floor(rnd() * 4);            // 9–12 vertices
+    const baseR = 36 + rnd() * 26;
+    const theta = [], baseRad = [], radPhase = [], lenPhase = [], kPhase = [];
+    const lx = [], ly = [], vx = [], vy = [];
+    for (let i = 0; i < sides; i++) {
+      const a = (i / sides) * 2 * Math.PI;
+      theta.push(a);
+      baseRad.push(baseR * (0.78 + 0.3 * rnd()));       // slightly irregular base silhouette
+      radPhase.push(rnd() * Math.PI * 2);
+      lenPhase.push(rnd() * Math.PI * 2);
+      kPhase.push(rnd() * Math.PI * 2);
+      lx.push(Math.cos(a) * baseRad[i]); ly.push(Math.sin(a) * baseRad[i]);
+      vx.push(0); vy.push(0);
+    }
+    const baseLen = [];
+    for (let i = 0; i < sides; i++) {                    // rest chord between adjacent slots
+      const j = (i + 1) % sides;
+      baseLen.push(Math.hypot(lx[j] - lx[i], ly[j] - ly[i]));
+    }
+    const R = Math.max(...baseRad);
+    blobs.push({
+      x: R + rnd() * (W - 2 * R), y: R + rnd() * (H - 2 * R),
+      vx: (rnd() * 2 - 1) * 55, vy: (rnd() * 2 - 1) * 55,
+      angle: rnd() * Math.PI * 2, spin: (rnd() * 2 - 1) * 0.5,
+      sides, theta, baseRad, baseLen, radPhase, lenPhase, kPhase,
+      lx, ly, lvx: vx, lvy: vy,
+      R, hue: Math.floor(rnd() * 360),
+      // independent slow rates per blob so they don't morph in lock-step
+      radW: 0.18 + rnd() * 0.22, lenW: 0.22 + rnd() * 0.25, kW: 0.10 + rnd() * 0.18,
+    });
+  }
+
+  // Relax one blob's soft body toward its (time-varying) targets, in local space.
+  function softBody(b, t) {
+    const n = b.sides;
+    // Current rest targets from slow sine drivers.
+    const restRad = new Array(n), restLen = new Array(n), kEdge = new Array(n);
+    for (let i = 0; i < n; i++) {
+      restRad[i] = b.baseRad[i] * (1 + 0.22 * Math.sin(t * b.radW + b.radPhase[i]));
+      restLen[i] = b.baseLen[i] * (1 + 0.70 * Math.sin(t * b.lenW + b.lenPhase[i]));  // big swing → lumps
+      kEdge[i]   = K_EDGE_BASE * (1 + 0.55 * Math.sin(t * b.kW + b.kPhase[i]));        // peak < K_ANCHOR
+    }
+
+    for (let s = 0; s < SUBSTEPS; s++) {
+      const fx = new Float64Array(n), fy = new Float64Array(n);
+      // Anchor springs: pull each vertex toward its morphing angular slot.
+      for (let i = 0; i < n; i++) {
+        const ax = Math.cos(b.theta[i]) * restRad[i], ay = Math.sin(b.theta[i]) * restRad[i];
+        fx[i] += K_ANCHOR * (ax - b.lx[i]);
+        fy[i] += K_ANCHOR * (ay - b.ly[i]);
+      }
+      // Edge springs: drifting rest length & stiffness between adjacent vertices.
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        const dx = b.lx[j] - b.lx[i], dy = b.ly[j] - b.ly[i];
+        const len = Math.hypot(dx, dy) || 1e-6;
+        const f = kEdge[i] * (len - restLen[i]) / len;
+        fx[i] += f * dx; fy[i] += f * dy;
+        fx[j] -= f * dx; fy[j] -= f * dy;
+      }
+      // Integrate (unit mass) with damping.
+      for (let i = 0; i < n; i++) {
+        b.lvx[i] = (b.lvx[i] + fx[i] * H_STEP) * DAMP;
+        b.lvy[i] = (b.lvy[i] + fy[i] * H_STEP) * DAMP;
+        b.lx[i] += b.lvx[i] * H_STEP;
+        b.ly[i] += b.lvy[i] * H_STEP;
+      }
+    }
+
+    // Re-center on the local centroid + refresh bounding radius for collisions.
+    let cx = 0, cy = 0;
+    for (let i = 0; i < n; i++) { cx += b.lx[i]; cy += b.ly[i]; }
+    cx /= n; cy /= n;
+    let R = 0;
+    for (let i = 0; i < n; i++) {
+      b.lx[i] -= cx; b.ly[i] -= cy;
+      R = Math.max(R, Math.hypot(b.lx[i], b.ly[i]));
+    }
+    b.R = R;
+  }
+
+  // World-space ring: rotate the local soft body by `angle`, translate to center.
+  const ringOf = (b) => {
+    const ca = Math.cos(b.angle), sa = Math.sin(b.angle), r = new Array(b.sides);
+    for (let i = 0; i < b.sides; i++) {
+      r[i] = [b.x + b.lx[i] * ca - b.ly[i] * sa, b.y + b.lx[i] * sa + b.ly[i] * ca];
+    }
+    return r;
+  };
+
+  function step(dt, t) {
+    // Morph + relax each blob's shape.
+    for (const b of blobs) { softBody(b, t); b.angle += b.spin * dt; }
+
+    // Global locomotion of the centers.
+    for (const b of blobs) { b.x += b.vx * dt; b.y += b.vy * dt; }
+    for (const b of blobs) {
+      if (b.x - b.R < 0) { b.x = b.R;     b.vx =  Math.abs(b.vx); }
+      if (b.x + b.R > W) { b.x = W - b.R; b.vx = -Math.abs(b.vx); }
+      if (b.y - b.R < 0) { b.y = b.R;     b.vy =  Math.abs(b.vy); }
+      if (b.y + b.R > H) { b.y = H - b.R; b.vy = -Math.abs(b.vy); }
+    }
+    // Soft mutual repulsion keeps bounding circles disjoint → input polygons
+    // stay separate → clean site provenance, no gaps in the separation network.
+    for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+      const a = blobs[i], b = blobs[j];
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1e-3, min = a.R + b.R + 10;
+      if (d < min) {
+        const ux = dx / d, uy = dy / d, push = (min - d) * 0.5;
+        a.x -= ux * push; a.y -= uy * push; b.x += ux * push; b.y += uy * push;
+        const va = a.vx * ux + a.vy * uy, vb = b.vx * ux + b.vy * uy, tt = vb - va;
+        a.vx += tt * ux; a.vy += tt * uy; b.vx -= tt * ux; b.vy -= tt * uy;
+      }
+    }
+  }
+
+  function draw(polys, sep) {
+    ctx.clearRect(0, 0, W, H);
+    for (let k = 0; k < polys.length; k++) {
+      const ring = polys[k], hue = blobs[k].hue;
+      ctx.beginPath();
+      ctx.moveTo(ring[0][0], ring[0][1]);
+      for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i][0], ring[i][1]);
+      ctx.closePath();
+      ctx.fillStyle = `hsla(${hue}, 70%, 55%, 0.12)`; ctx.fill();
+      ctx.strokeStyle = `hsla(${hue}, 70%, 65%, 0.55)`; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+    const far = W * 2;
+    ctx.save();
+    ctx.shadowColor = "#22c55e"; ctx.shadowBlur = 8;
+    ctx.strokeStyle = "#34d399"; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (const e of sep) {
+      const pts = tessellate(e.geometry, { parabolaSamples: 20, infiniteLength: far });
+      if (pts.length < 2) continue;
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // --- Animation loop: recompute the diagram every frame. rAF only re-arms
+  //     after voronoi() resolves, so the loop self-throttles to the wasm cost. ---
+  let last = performance.now(), emaMs = 0;
+  async function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+
+    step(dt, now / 1000);
+    const polys = blobs.map(ringOf);
+
+    const t0 = performance.now();
+    const { edges } = await voronoi(polys);
+    const sep = edges.filter(separatesPolygons);
+    emaMs = emaMs ? emaMs * 0.9 + (performance.now() - t0) * 0.1 : (performance.now() - t0);
+
+    draw(polys, sep);
+    const segs = polys.reduce((a, p) => a + p.length, 0);
+    hud.textContent =
+      `${N} morphing blobs · ${segs} segments\n` +
+      `voronoi(): ${emaMs.toFixed(1)} ms  (~${(1000 / Math.max(emaMs, 1)).toFixed(0)} fps cap)\n` +
+      `separating edges: ${sep.length} / ${edges.length}`;
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

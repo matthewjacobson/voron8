@@ -4,7 +4,7 @@
 
 The segment **Voro**noi diagram of polygons, computed by [CGAL](https://www.cgal.org/) and shipped as WebAssembly.
 
-**[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)** · **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive))
+**[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)** · **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive)) · **[Compound-Voronoi demo →](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html)** (live soft-body blobs)
 
 Give it an array of polygons; get back a graph of Voronoi vertices and edges where:
 
@@ -119,9 +119,30 @@ Returns a polyline. Straight edges return their two endpoints; parabolic arcs ar
 medialAxis(polygons: Polygon[]): Promise<VoronoiResult>;
 ```
 
-The interior **medial axis** (skeleton) of the filled region: every interior Voronoi edge *except* the degenerate bisectors between a polygon vertex and one of its own incident edges. Because CGAL treats each segment endpoint as its own site, those incident pairs produce perpendicular bisectors that touch the boundary at a single point and aren't part of the skeleton. Everything else is kept — including the parabolic arcs between a reflex vertex and the wall facing it, and bisectors between two reflex vertices ([per Richard's CGAL answer](https://stackoverflow.com/questions/69237154/how-do-you-get-the-medial-axis-of-a-multipolygon-using-cgal)). The result shares the same `vertices` as `voronoi()` (so `from`/`to` indices stay valid) with `edges` narrowed to the medial axis.
+The interior **medial axis** (skeleton) of the filled region: every interior Voronoi edge *except* the degenerate bisectors between a polygon vertex and one of its own incident edges. Because CGAL treats each segment endpoint as its own site, those incident pairs produce perpendicular bisectors that touch the boundary at a single point and aren't part of the skeleton. Everything else is kept — including the parabolic arcs between a reflex vertex and the wall facing it, and bisectors between two reflex vertices. The result shares the same `vertices` as `voronoi()` (so `from`/`to` indices stay valid) with `edges` narrowed to the medial axis.
 
 The interactive [medial-axis demo](https://matthewjacobson.github.io/voron8/example/medial-axis.html) runs this over shapes from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive), with three sliders that feature-prune the axis. The pruning follows the rooted-tree model of [micycle1's PGS `MedialAxis`](https://github.com/micycle1/PGS/blob/8231057/src/main/java/micycle/pgs/PGS_Contour.java): the axis is rooted at its widest disk, and three normalized 0..1 thresholds prune it — **axial** (per-edge gradient `d(radius)/d(length)`), **distance** (geodesic distance from the root), and **area** (a subtree's aggregate feature area, normalized per connected component) — each cutting an edge and its whole subtree. It's plain client-side code in [`example/prune.js`](example/prune.js); voron8 itself returns the unpruned axis.
+
+### Edges that separate two polygons
+
+When you pass several polygons at once, the edges whose two sites come from *different* polygons trace the boundary between them — the compound-Voronoi partition. Every edge already carries the two `sites` it bisects, and each site knows the polygon it came from, so you can filter for these directly — no need to inspect `from`/`to` (those index the edge's *endpoints*, not the cells it divides):
+
+```js
+// The polygon a site originates from, or null if it can't be attributed.
+const sitePolygon = (s) =>
+  s.type === "point"   ? (s.source?.polygon ?? null) :
+  s.type === "segment" ? (s.segment?.[0]?.polygon ?? s.segment?.[1]?.polygon ?? null) :
+  null; // infinite
+
+const { edges } = await voronoi(polygons);
+const separating = edges.filter((e) => {
+  const [a, b] = e.sites;
+  const pa = sitePolygon(a), pb = sitePolygon(b);
+  return pa !== null && pb !== null && pa !== pb;
+});
+```
+
+(A segment site's two endpoints are consecutive vertices of the same ring, so either one gives its polygon; endpoints read `null` only for points CGAL synthesized, e.g. where two input rings cross.) The live [compound-Voronoi demo](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html) animates a set of morphing soft-body blobs and redraws this separation network every frame.
 
 ## Why a polygon corner shows up as a Voronoi vertex
 
