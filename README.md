@@ -75,7 +75,7 @@ For a classic `<script>` tag, load the UMD build from a CDN; it exposes a global
 `voron8`:
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/voron8/dist/voron8.umd.cjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/voron8/dist/voron8.umd.js"></script>
 <script>
   voron8.init().then(() => {
     const { edges } = voron8.voronoi([[ [0, 0], [4, 0], [4, 4], [0, 4] ]]);
@@ -88,7 +88,7 @@ For a classic `<script>` tag, load the UMD build from a CDN; it exposes a global
 
 ```ts
 type Polygon = Point[] | Array<[number, number]>;
-voronoi(polygons: Polygon[]): Promise<VoronoiResult>;
+voronoi(polygons: Polygon[]): VoronoiResult; // await init() once first
 ```
 
 - Each polygon is a closed ring of vertices (do **not** repeat the first point at the end).

@@ -25,10 +25,11 @@
     <canvas id="c"></canvas>
 
     <!-- UMD build straight from the CDN. The package's `jsdelivr` field points
-         at dist/voron8.umd.cjs, so `voron8@2.0.2` resolves to it too; the full
+         at dist/voron8.umd.js, so `voron8@2.0.3` resolves to it too; the full
          path is spelled out here for clarity. Pin a version for reproducibility;
-         drop `@2.0.2` to always track the latest. -->
-    <script src="https://cdn.jsdelivr.net/npm/voron8@2.0.2/dist/voron8.umd.cjs"></script>
+         drop `@2.0.3` to always track the latest. (Use the .js build, not .cjs:
+         CDNs serve .cjs with a non-JS MIME type that blocks <script> execution.) -->
+    <script src="https://cdn.jsdelivr.net/npm/voron8@2.0.3/dist/voron8.umd.js"></script>
     <script>
       // `voron8` is now a global. init() loads the inlined wasm (the only async
       // step); voronoi()/medialAxis() are synchronous afterwards.

@@ -2,6 +2,7 @@
 // ESM file at dist/voron8.js, and emit type declarations alongside it.
 import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -30,11 +31,15 @@ await build({
 // UMD build for `require()` and classic `<script>` tags. esbuild has no native
 // UMD format, so we emit a CommonJS bundle and wrap it: the banner picks the
 // AMD / CommonJS / browser-global path, then runs esbuild's `module.exports`
-// code against a factory-local `module`. The `.cjs` extension forces Node to
-// load it as CommonJS even though the package is `"type": "module"`. Under a
-// browser global, the wrapper assigns `window.voron8`; Emscripten's external
-// `require()` calls live only inside its Node-detection branches, so they are
-// never reached there.
+// code against a factory-local `module`. Under a browser global the wrapper
+// assigns `window.voron8`; Emscripten's external `require()` calls live only
+// inside its Node-detection branches, so they are never reached there.
+//
+// The same bytes are written twice: .js for browser/CDN <script> tags (CDNs
+// serve .cjs with a non-JS MIME type — jsDelivr uses application/node — which
+// blocks classic-script execution under X-Content-Type-Options: nosniff), and
+// .cjs so Node treats it as CommonJS for the "require" export condition even
+// though the package is "type": "module".
 const umdBanner = `(function (root, factory) {
   if (typeof define === "function" && define.amd) define([], factory);
   else if (typeof module === "object" && typeof module.exports === "object") module.exports = factory();
@@ -54,14 +59,18 @@ const umdBanner = `(function (root, factory) {
 const umdFooter = `  return module.exports;
 });`;
 
-await build({
+const umd = await build({
   ...common,
-  outfile: resolve(root, "dist/voron8.umd.cjs"),
+  outfile: resolve(root, "dist/voron8.umd.js"),
   format: "cjs",
   define: { "import.meta.url": "_umdMetaUrl" },
   banner: { js: umdBanner },
   footer: { js: umdFooter },
+  write: false,
 });
+const umdCode = umd.outputFiles[0].text;
+writeFileSync(resolve(root, "dist/voron8.umd.js"), umdCode);
+writeFileSync(resolve(root, "dist/voron8.umd.cjs"), umdCode);
 
 // esbuild does not emit declarations — let tsc produce them.
 execFileSync(
@@ -72,4 +81,6 @@ execFileSync(
   { cwd: root, stdio: "inherit" },
 );
 
-console.log("Built dist/voron8.js, dist/voron8.umd.cjs and dist/index.d.ts");
+console.log(
+  "Built dist/voron8.js, dist/voron8.umd.js, dist/voron8.umd.cjs and dist/index.d.ts",
+);
