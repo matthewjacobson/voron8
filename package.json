@@ -28,6 +28,7 @@
     "cpp",
     "scripts",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
