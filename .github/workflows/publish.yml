@@ -48,13 +48,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#v}"
+          link="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for full history."
           notes="$(awk -v v="$version" '
             $0 ~ "^## \\[" v "\\]" { p = 1; next }
             p && /^## \[/ { exit }
             p { print }
           ' CHANGELOG.md)"
           if [ -n "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
-            printf '%s\n' "$notes" | gh release create "$GITHUB_REF_NAME" \
+            printf '%s\n\n%s\n' "$notes" "$link" | gh release create "$GITHUB_REF_NAME" \
               --title "$GITHUB_REF_NAME" --notes-file -
           else
             gh release create "$GITHUB_REF_NAME" \
