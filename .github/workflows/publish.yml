@@ -31,6 +31,10 @@ jobs:
 
       - run: npm ci
 
+      # The wasm artifact (src/core/voronoi.js) is committed but dist/ is not,
+      # so build the bundle the tests import before running them.
+      - run: npm run build
+
       - run: npm test
 
       # No token, no --provenance: OIDC authenticates the publish and npm
