@@ -1,6 +1,9 @@
-import { test } from "node:test";
+import { test, before } from "node:test";
 import assert from "node:assert/strict";
 import { voronoi, medialAxis, tessellate, init } from "../dist/voron8.js";
+
+// voronoi()/medialAxis() are synchronous; load the wasm once up front.
+before(() => init());
 
 const SQUARE = [
   [
@@ -19,13 +22,13 @@ test("init() returns the same cached module", async () => {
 });
 
 test("square produces a Voronoi graph", async () => {
-  const { vertices, edges } = await voronoi(SQUARE);
+  const { vertices, edges } = voronoi(SQUARE);
   assert.ok(vertices.length >= 5, "has interior + corner vertices");
   assert.ok(edges.length > 0, "has edges");
 });
 
 test("input polygon corners are flagged and mapped back to source", async () => {
-  const { vertices } = await voronoi(SQUARE);
+  const { vertices } = voronoi(SQUARE);
   const inputs = vertices.filter((v) => v.isInput);
   assert.equal(inputs.length, 4, "all four corners coincide with Voronoi vertices");
 
@@ -44,7 +47,7 @@ test("input polygon corners are flagged and mapped back to source", async () => 
 });
 
 test("the medial axis (interior) of a square meets at its center", async () => {
-  const { vertices, edges } = await voronoi(SQUARE);
+  const { vertices, edges } = voronoi(SQUARE);
   const interior = edges.filter((e) => e.location === "interior");
   assert.ok(interior.length >= 4, "square has interior medial edges");
 
@@ -63,7 +66,7 @@ test("the medial axis (interior) of a square meets at its center", async () => {
 });
 
 test("unbounded bisectors are labeled exterior", async () => {
-  const { edges } = await voronoi(SQUARE);
+  const { edges } = voronoi(SQUARE);
   const rays = edges.filter((e) => e.geometry.type === "ray");
   assert.ok(rays.length > 0, "a square has exterior rays");
   for (const r of rays) {
@@ -72,7 +75,7 @@ test("unbounded bisectors are labeled exterior", async () => {
 });
 
 test("edge endpoints index into the vertex array", async () => {
-  const { vertices, edges } = await voronoi(SQUARE);
+  const { vertices, edges } = voronoi(SQUARE);
   for (const e of edges) {
     for (const idx of [e.from, e.to]) {
       assert.ok(idx === -1 || (idx >= 0 && idx < vertices.length));
@@ -94,7 +97,7 @@ test("a hole flips interior/exterior (even-odd fill)", async () => {
     [6, 6],
     [4, 6],
   ];
-  const { edges } = await voronoi([outer, hole]);
+  const { edges } = voronoi([outer, hole]);
 
   // The center of the hole is outside the filled region — any bisector sampled
   // there must be exterior. Confirm at least one edge sits near the hole center
@@ -113,7 +116,7 @@ test("a hole flips interior/exterior (even-odd fill)", async () => {
 });
 
 test("every edge reports its two defining sites", async () => {
-  const { edges } = await voronoi(SQUARE);
+  const { edges } = voronoi(SQUARE);
   for (const e of edges) {
     assert.equal(e.sites.length, 2);
     for (const s of e.sites) {
@@ -153,8 +156,8 @@ function isIncidentBisector(e) {
 }
 
 test("medialAxis drops only the degenerate incident bisectors", async () => {
-  const full = await voronoi(L_SHAPE);
-  const medial = await medialAxis(L_SHAPE);
+  const full = voronoi(L_SHAPE);
+  const medial = medialAxis(L_SHAPE);
 
   const interior = full.edges.filter((e) => e.location === "interior");
   assert.ok(medial.edges.length > 0, "medial axis is non-empty");
@@ -180,8 +183,8 @@ test("medialAxis drops only the degenerate incident bisectors", async () => {
 test("parabolic arcs are always part of the medial axis", async () => {
   // The arc bisectors (reflex vertex vs. a facing wall) are genuine medial axis
   // edges — a regression guard against over-pruning them.
-  const full = await voronoi(L_SHAPE);
-  const medial = await medialAxis(L_SHAPE);
+  const full = voronoi(L_SHAPE);
+  const medial = medialAxis(L_SHAPE);
   const interiorParabolas = full.edges.filter(
     (e) => e.location === "interior" && e.geometry.type === "parabola",
   ).length;
@@ -194,14 +197,14 @@ test("parabolic arcs are always part of the medial axis", async () => {
 
 test("a convex polygon's medial axis equals its interior edges", async () => {
   // No reflex vertices, so there are no interior incident bisectors to prune.
-  const full = await voronoi(SQUARE);
-  const medial = await medialAxis(SQUARE);
+  const full = voronoi(SQUARE);
+  const medial = medialAxis(SQUARE);
   const interior = full.edges.filter((e) => e.location === "interior");
   assert.equal(medial.edges.length, interior.length);
 });
 
 test("tessellate turns geometry into polylines", async () => {
-  const { edges } = await voronoi(SQUARE);
+  const { edges } = voronoi(SQUARE);
 
   const seg = edges.find((e) => e.geometry.type === "segment");
   const segLine = tessellate(seg.geometry);
@@ -230,7 +233,7 @@ test("parabolic arcs appear for non-convex input and sample on-curve", async () 
       [0, 6],
     ],
   ];
-  const { edges } = await voronoi(L);
+  const { edges } = voronoi(L);
   const parabolas = edges.filter((e) => e.geometry.type === "parabola");
   assert.ok(parabolas.length > 0, "L-shape produces parabolic bisectors");
 

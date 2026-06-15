@@ -40,7 +40,7 @@
 
     <script type="module">
       // Built bundle (run `npm run build`, then serve the repo and open /example/medial-axis.html).
-      import { voronoi, medialAxis, tessellate } from "../dist/voron8.js";
+      import { init, voronoi, medialAxis, tessellate } from "../dist/voron8.js";
       import { buildMedialTree, pruneTree } from "./prune.js";
 
       // Polygons from LingDong-/interesting-polygon-archive (JSON: a 3D array
@@ -95,10 +95,8 @@
         if (!res.ok) throw new Error(`fetch failed (${res.status})`);
         // contours: number[][][] — already voron8's Polygon[] (rings of [x,y]).
         const polygons = await res.json();
-        const [full, medial] = await Promise.all([
-          voronoi(polygons),
-          medialAxis(polygons),
-        ]);
+        const full = voronoi(polygons);
+        const medial = medialAxis(polygons);
         // Rooted-tree pruning metrics (geometry-only; cheap to re-prune per slider).
         const tree = buildMedialTree(medial, polygons, tessellate, 24);
         current = { polygons, full, medial, tree, bbox: bboxOf(polygons), alive: null };
@@ -196,7 +194,9 @@
         loadPolygon(pick.value).catch((e) => (statusEl.textContent = "error: " + e.message)),
       );
 
-      loadPolygon(pick.value).catch((e) => (statusEl.textContent = "error: " + e.message));
+      init()
+        .then(() => loadPolygon(pick.value))
+        .catch((e) => (statusEl.textContent = "error: " + e.message));
     </script>
   </body>
 </html>

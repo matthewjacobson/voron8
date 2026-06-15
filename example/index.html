@@ -31,7 +31,9 @@
     <script type="module">
       // Built artifact. Run `npm run build` first, then serve this folder:
       //   npx serve .    (or any static server)  and open /example/
-      import { voronoi, tessellate } from "../dist/voron8.js";
+      import { init, voronoi, tessellate } from "../dist/voron8.js";
+
+      await init();
 
       // An L-shape (reflex corner -> parabolic bisectors) plus a triangle.
       const polygons = [
@@ -39,7 +41,7 @@
         [ [420, 120], [620, 120], [520, 320] ],
       ];
 
-      const { vertices, edges } = await voronoi(polygons);
+      const { vertices, edges } = voronoi(polygons);
 
       const canvas = document.getElementById("c");
       const ctx = canvas.getContext("2d");

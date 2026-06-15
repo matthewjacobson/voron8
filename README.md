@@ -22,14 +22,17 @@ npm install voron8
 ## Usage
 
 ```js
-import { voronoi, medialAxis, tessellate } from "voron8";
+import { init, voronoi, medialAxis, tessellate } from "voron8";
+
+// Load the wasm once. This is the only asynchronous step.
+await init();
 
 // One ring per polygon. Points may be {x, y} or [x, y]; rings auto-close.
 const square = [
   [ [0, 0], [4, 0], [4, 4], [0, 4] ],
 ];
 
-const { vertices, edges } = await voronoi(square);
+const { vertices, edges } = voronoi(square);
 
 // Which Voronoi vertices are original polygon corners?
 for (const v of vertices) {
@@ -39,7 +42,7 @@ for (const v of vertices) {
 }
 
 // The medial axis (interior skeleton) of the shape.
-const skeleton = await medialAxis(square);
+const skeleton = medialAxis(square);
 
 // Turn any edge — straight, ray, or curved parabolic arc — into a polyline.
 for (const e of skeleton.edges) {
@@ -48,7 +51,9 @@ for (const e of skeleton.edges) {
 }
 ```
 
-`init()` is awaited automatically by `voronoi()`; call it yourself only if you want to warm the wasm up ahead of time.
+`init()` loads and caches the wasm module; call it once (awaiting it) before
+`voronoi()` or `medialAxis()`, which are synchronous and throw if it hasn't
+finished. Calling `init()` again just returns the cached module.
 
 ### Module formats
 
@@ -57,10 +62,10 @@ inlined in both, so there are no extra assets to host.
 
 ```js
 // ES modules / bundlers
-import { voronoi, medialAxis, tessellate } from "voron8";
+import { init, voronoi, medialAxis, tessellate } from "voron8";
 
 // CommonJS
-const { voronoi, medialAxis, tessellate } = require("voron8");
+const { init, voronoi, medialAxis, tessellate } = require("voron8");
 ```
 
 For a classic `<script>` tag, load the UMD build from a CDN; it exposes a global
@@ -69,7 +74,8 @@ For a classic `<script>` tag, load the UMD build from a CDN; it exposes a global
 ```html
 <script src="https://cdn.jsdelivr.net/npm/voron8/dist/voron8.umd.cjs"></script>
 <script>
-  voron8.voronoi([[ [0, 0], [4, 0], [4, 4], [0, 4] ]]).then(({ edges }) => {
+  voron8.init().then(() => {
+    const { edges } = voron8.voronoi([[ [0, 0], [4, 0], [4, 4], [0, 4] ]]);
     console.log(edges.length);
   });
 </script>

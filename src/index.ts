@@ -110,16 +110,31 @@ type WasmModule = {
 };
 
 let modulePromise: Promise<WasmModule> | null = null;
+let wasmModule: WasmModule | null = null;
 
 /**
- * Load and cache the WebAssembly module. Optional to call — voronoi() awaits it
- * automatically — but useful to warm up the wasm ahead of time.
+ * Load and cache the WebAssembly module. This is the only asynchronous step;
+ * await it once before calling voronoi()/medialAxis(), which are synchronous.
+ * Calling it again returns the same cached module.
  */
 export function init(): Promise<WasmModule> {
   if (!modulePromise) {
-    modulePromise = createVoron8Module() as Promise<WasmModule>;
+    modulePromise = (createVoron8Module() as Promise<WasmModule>).then((mod) => {
+      wasmModule = mod;
+      return mod;
+    });
   }
   return modulePromise;
+}
+
+/** Return the loaded module, or throw if init() has not completed yet. */
+function getModule(): WasmModule {
+  if (!wasmModule) {
+    throw new Error(
+      "voron8: wasm not initialized — await init() once before calling voronoi() or medialAxis().",
+    );
+  }
+  return wasmModule;
 }
 
 function toXY(p: Point | [number, number]): [number, number] {
@@ -193,12 +208,14 @@ function sampleOf(geom: EdgeGeometry): Point | null {
 /**
  * Compute the segment Voronoi diagram of one or more polygons.
  *
+ * Synchronous: await init() once before calling this (it throws otherwise).
+ *
  * @param polygons Array of rings. Each ring is a list of points ({x,y} or
  *                 [x,y]); rings are treated as closed. Nested rings act as holes
  *                 under the even-odd fill rule used for interior/exterior labels.
  */
-export async function voronoi(polygons: Polygon[]): Promise<VoronoiResult> {
-  const mod = await init();
+export function voronoi(polygons: Polygon[]): VoronoiResult {
+  const mod = getModule();
 
   const coords: number[] = [];
   const ringSizes: number[] = [];
@@ -262,10 +279,12 @@ export async function voronoi(polygons: Polygon[]): Promise<VoronoiResult> {
  * Returns the same `vertices` as `voronoi()` (so edge `from`/`to` indices stay
  * valid) with `edges` narrowed to the medial axis.
  *
+ * Synchronous: await init() once before calling this (it throws otherwise).
+ *
  * @see https://stackoverflow.com/questions/69237154 (Richard's CGAL answer)
  */
-export async function medialAxis(polygons: Polygon[]): Promise<VoronoiResult> {
-  const result = await voronoi(polygons);
+export function medialAxis(polygons: Polygon[]): VoronoiResult {
+  const result = voronoi(polygons);
   const edges = result.edges.filter(
     (e) => e.location === "interior" && !isIncidentBisector(e),
   );

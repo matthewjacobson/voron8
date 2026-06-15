@@ -18,7 +18,7 @@
 <canvas id="c" width="800" height="800"></canvas>
 <pre id="hud"></pre>
 <script type="module">
-  import { voronoi, tessellate } from "../dist/voron8.js";
+  import { init, voronoi, tessellate } from "../dist/voron8.js";
 
   const W = 800, H = 800;
   const canvas = document.getElementById("c");
@@ -202,10 +202,10 @@
     ctx.restore();
   }
 
-  // --- Animation loop: recompute the diagram every frame. rAF only re-arms
-  //     after voronoi() resolves, so the loop self-throttles to the wasm cost. ---
+  // --- Animation loop: recompute the diagram every frame. voronoi() is
+  //     synchronous, so each frame's cost is just the wasm compute. ---
   let last = performance.now(), emaMs = 0;
-  async function frame(now) {
+  function frame(now) {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
 
@@ -213,7 +213,7 @@
     const polys = blobs.map(ringOf);
 
     const t0 = performance.now();
-    const { edges } = await voronoi(polys);
+    const { edges } = voronoi(polys);
     const sep = edges.filter(separatesPolygons);
     emaMs = emaMs ? emaMs * 0.9 + (performance.now() - t0) * 0.1 : (performance.now() - t0);
 
@@ -226,6 +226,7 @@
 
     requestAnimationFrame(frame);
   }
+  await init();
   requestAnimationFrame(frame);
 </script>
 </body>

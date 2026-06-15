@@ -1,7 +1,10 @@
-import { test } from "node:test";
+import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { medialAxis, tessellate } from "../dist/voron8.js";
+import { init, medialAxis, tessellate } from "../dist/voron8.js";
 import { buildMedialTree, pruneTree } from "../example/prune.js";
+
+// medialAxis() is synchronous; load the wasm once up front.
+before(() => init());
 
 // A rectangle with four short spikes off the top edge — small features that
 // pruning should remove before the main horizontal spine.
@@ -21,7 +24,7 @@ const L_SHAPE = [
 ];
 
 async function setup(polygons) {
-  const medial = await medialAxis(polygons);
+  const medial = medialAxis(polygons);
   const tree = buildMedialTree(medial, polygons, tessellate, 24);
   const boundedCount = medial.edges.filter((e) => e.from >= 0 && e.to >= 0).length;
   const keep = (a, d, ar) => pruneTree(tree, a, d, ar).filter(Boolean).length;
@@ -97,7 +100,7 @@ test("area threshold normalizes per connected component", async () => {
   // A big square and a far-off tiny square — two disconnected medial components.
   const big = [[0, 0], [100, 0], [100, 100], [0, 100]];
   const small = [[300, 300], [310, 300], [310, 310], [300, 310]];
-  const medial = await medialAxis([big, small]);
+  const medial = medialAxis([big, small]);
   const tree = buildMedialTree(medial, [big, small], tessellate, 24);
   assert.equal(tree.roots.length, 2, "two disconnected components");
 
