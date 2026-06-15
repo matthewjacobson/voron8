@@ -4,7 +4,10 @@
 
 The segment **Voro**noi diagram of polygons, computed by [CGAL](https://www.cgal.org/) and shipped as WebAssembly.
 
-**[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)** · **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive)) · **[Compound-Voronoi demo →](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html)** (live soft-body blobs)
+- **[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)**
+- **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive))
+- **[Compound-Voronoi demo →](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html)** (live soft-body blobs)
+- **[CDN/UMD demo →](https://matthewjacobson.github.io/voron8/example/cdn-umd.html)** (no build step)
 
 Give it an array of polygons; get back a graph of Voronoi vertices and edges where:
 

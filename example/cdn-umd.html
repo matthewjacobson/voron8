@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>voron8 — UMD build from a CDN</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+      header { padding: 12px 16px; border-bottom: 1px solid #232733; }
+      header h1 { margin: 0 0 4px; font-size: 16px; }
+      header p { margin: 0; color: #9aa4b2; }
+      header code { color: #60a5fa; }
+      canvas { display: block; width: 100%; height: calc(100vh - 72px); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>voron8 — UMD build from a CDN</h1>
+      <p>
+        No bundler, no build step: this page loads
+        <code>voron8.umd.cjs</code> from jsDelivr via a classic
+        <code>&lt;script&gt;</code> tag, which exposes a global <code>voron8</code>.
+      </p>
+    </header>
+    <canvas id="c"></canvas>
+
+    <!-- UMD build straight from the CDN. The package's `jsdelivr` field points
+         at dist/voron8.umd.cjs, so `voron8@2.0.2` resolves to it too; the full
+         path is spelled out here for clarity. Pin a version for reproducibility;
+         drop `@2.0.2` to always track the latest. -->
+    <script src="https://cdn.jsdelivr.net/npm/voron8@2.0.2/dist/voron8.umd.cjs"></script>
+    <script>
+      // `voron8` is now a global. init() loads the inlined wasm (the only async
+      // step); voronoi()/medialAxis() are synchronous afterwards.
+      voron8.init().then(() => {
+        // An L-shape (reflex corner -> parabolic bisectors) plus a triangle.
+        const polygons = [
+          [ [40, 40], [320, 40], [320, 180], [160, 180], [160, 360], [40, 360] ],
+          [ [420, 120], [620, 120], [520, 320] ],
+        ];
+
+        const { vertices, edges } = voron8.voronoi(polygons);
+
+        const canvas = document.getElementById("c");
+        const ctx = canvas.getContext("2d");
+
+        function line(pts, color, width) {
+          if (pts.length < 2) return;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = width;
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+          ctx.stroke();
+        }
+
+        function draw() {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          // Clip rays/lines to the visible canvas so exterior edges stay sane.
+          const far = Math.max(canvas.clientWidth, canvas.clientHeight) * 2;
+
+          for (const e of edges) {
+            const pts = voron8.tessellate(e.geometry, { parabolaSamples: 28, infiniteLength: far });
+            line(pts, e.location === "interior" ? "#22c55e" : "#6b7280",
+                 e.location === "interior" ? 2 : 1);
+          }
+
+          // Input polygons on top.
+          for (const ring of polygons) {
+            line([...ring, ring[0]].map(([x, y]) => ({ x, y })), "#3b82f6", 1.5);
+          }
+
+          // Vertices (input corners highlighted).
+          for (const v of vertices) {
+            ctx.fillStyle = v.isInput ? "#f59e0b" : "#e6e6e6";
+            ctx.beginPath();
+            ctx.arc(v.x, v.y, v.isInput ? 4 : 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        function resize() {
+          const dpr = window.devicePixelRatio || 1;
+          canvas.width = canvas.clientWidth * dpr;
+          canvas.height = canvas.clientHeight * dpr;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          draw();
+        }
+        window.addEventListener("resize", resize);
+        resize();
+      });
+    </script>
+  </body>
+</html>
