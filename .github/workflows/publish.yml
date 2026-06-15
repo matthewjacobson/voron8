@@ -16,7 +16,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # create the GitHub Release for the tag
       id-token: write # mints the OIDC token npm exchanges for publish auth
     steps:
       - uses: actions/checkout@v5
@@ -40,3 +40,23 @@ jobs:
       # No token, no --provenance: OIDC authenticates the publish and npm
       # generates the provenance attestation automatically.
       - run: npm publish
+
+      # Create the matching GitHub Release, using this version's CHANGELOG
+      # section as the notes (falling back to auto-generated notes if absent).
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes="$(awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { p = 1; next }
+            p && /^## \[/ { exit }
+            p { print }
+          ' CHANGELOG.md)"
+          if [ -n "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            printf '%s\n' "$notes" | gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" --notes-file -
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi
