@@ -9,9 +9,13 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/voron8.js"
+      "import": "./dist/voron8.js",
+      "require": "./dist/voron8.umd.cjs",
+      "default": "./dist/voron8.js"
     }
   },
+  "unpkg": "dist/voron8.umd.cjs",
+  "jsdelivr": "dist/voron8.umd.cjs",
   "files": [
     "dist",
     "src",

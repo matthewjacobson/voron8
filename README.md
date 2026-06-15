@@ -50,6 +50,31 @@ for (const e of skeleton.edges) {
 
 `init()` is awaited automatically by `voronoi()`; call it yourself only if you want to warm the wasm up ahead of time.
 
+### Module formats
+
+The package ships an ES module (the default) and a UMD build. The wasm core is
+inlined in both, so there are no extra assets to host.
+
+```js
+// ES modules / bundlers
+import { voronoi, medialAxis, tessellate } from "voron8";
+
+// CommonJS
+const { voronoi, medialAxis, tessellate } = require("voron8");
+```
+
+For a classic `<script>` tag, load the UMD build from a CDN; it exposes a global
+`voron8`:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/voron8/dist/voron8.umd.cjs"></script>
+<script>
+  voron8.voronoi([[ [0, 0], [4, 0], [4, 4], [0, 4] ]]).then(({ edges }) => {
+    console.log(edges.length);
+  });
+</script>
+```
+
 ## Input
 
 ```ts
@@ -156,7 +181,7 @@ Requirements: [Emscripten](https://emscripten.org/) (`emcc` on `PATH`), plus CGA
 
 ```sh
 npm run build:wasm   # cpp/voronoi.cpp -> src/core/voronoi.js (single-file ESM)
-npm run build        # bundle the TS API + wasm -> dist/voron8.js (+ .d.ts)
+npm run build        # bundle the TS API + wasm -> dist/voron8.js (ESM), dist/voron8.umd.cjs (UMD) (+ .d.ts)
 npm run build:all    # both
 npm test
 ```
