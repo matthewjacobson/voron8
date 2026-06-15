@@ -19,9 +19,9 @@ jobs:
       contents: read
       id-token: write # mints the OIDC token npm exchanges for publish auth
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           # Trusted publishing requires Node >= 22.14.0.
           node-version: 22
