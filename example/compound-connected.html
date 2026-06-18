@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>voron8 — Connected-component compound shapes (live)</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0f14; }
+      body { display: grid; place-items: center; }
+      canvas { background: #0b0f14; box-shadow: 0 0 60px #000 inset; border-radius: 6px; }
+      #hud {
+        position: fixed; top: 10px; left: 12px; margin: 0;
+        font: 12px/1.5 ui-monospace, Menlo, monospace; color: #6b7a89;
+        pointer-events: none; white-space: pre;
+      }
+      #nav { position: fixed; top: 10px; right: 14px; font: 12px ui-monospace, Menlo, monospace; }
+      #nav a { color: #60a5fa; text-decoration: none; }
+    </style>
+</head>
+<body>
+<canvas id="c" width="800" height="800"></canvas>
+<pre id="hud"></pre>
+<nav id="nav"><a href="./compound-voronoi.html">Compound-Voronoi demo →</a> · <a href="./">Voronoi demo →</a></nav>
+<script type="module">
+  // Free-floating open "strokes" (polylines) that are allowed to OVERLAP and
+  // CROSS — there is no mutual repulsion here. When two strokes cross, their ink
+  // becomes connected, so we treat them as a single compound shape: we group the
+  // inputs into connected components (union-find over shared endpoints and
+  // crossings) and color each component as one shape.
+  //
+  // The compound-Voronoi separation network (green) is then drawn only between
+  // *different* components. A crossing is interior to one merged shape, so the
+  // bisectors there are not separators — exactly the edges whose attribution
+  // would be ambiguous (the synthesized crossing point has null provenance) are
+  // also the ones we correctly drop. Watch components merge and split as strokes
+  // drift through one another.
+  import { init, voronoi, tessellate } from "../dist/voron8.js";
+
+  const W = 800, H = 800;
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const hud = document.getElementById("hud");
+
+  // Seeded RNG so the scene is reproducible across reloads.
+  let seed = 0x1234567 >>> 0;
+  const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+
+  // --- Strokes: rigid open polylines that translate + rotate and bounce off
+  //     the walls. No repulsion → they cross freely. ---
+  const N = 8;
+  const strokes = [];
+  for (let k = 0; k < N; k++) {
+    const P = 3 + Math.floor(rnd() * 3);                 // 3–5 vertices
+    const L = 55 + rnd() * 45;                           // half-length
+    const local = [];
+    let R = 0;
+    for (let i = 0; i < P; i++) {
+      const x = -L + (2 * L) * (i / (P - 1));
+      const y = (rnd() * 2 - 1) * 34;                    // gentle wiggle → a curved stroke
+      local.push([x, y]);
+      R = Math.max(R, Math.hypot(x, y));
+    }
+    strokes.push({
+      x: R + rnd() * (W - 2 * R), y: R + rnd() * (H - 2 * R),
+      vx: (rnd() * 2 - 1) * 90, vy: (rnd() * 2 - 1) * 90,
+      angle: rnd() * Math.PI * 2, spin: (rnd() * 2 - 1) * 0.7,
+      local, R,
+    });
+  }
+
+  // World-space vertices of a stroke (rotate local by angle, translate to center).
+  const worldOf = (s) => {
+    const ca = Math.cos(s.angle), sa = Math.sin(s.angle);
+    return s.local.map(([x, y]) => [s.x + x * ca - y * sa, s.y + x * sa + y * ca]);
+  };
+
+  function step(dt) {
+    for (const s of strokes) {
+      s.x += s.vx * dt; s.y += s.vy * dt; s.angle += s.spin * dt;
+      if (s.x - s.R < 0) { s.x = s.R;     s.vx =  Math.abs(s.vx); }
+      if (s.x + s.R > W) { s.x = W - s.R; s.vx = -Math.abs(s.vx); }
+      if (s.y - s.R < 0) { s.y = s.R;     s.vy =  Math.abs(s.vy); }
+      if (s.y + s.R > H) { s.y = H - s.R; s.vy = -Math.abs(s.vy); }
+    }
+  }
+
+  // --- Geometry: proper segment crossing via orientation signs. ---
+  const ccw = (ax, ay, bx, by, cx, cy) => (by - ay) * (cx - ax) - (bx - ax) * (cy - ay);
+  function segCross(a, b, c, d) {
+    const d1 = ccw(c[0], c[1], d[0], d[1], a[0], a[1]);
+    const d2 = ccw(c[0], c[1], d[0], d[1], b[0], b[1]);
+    const d3 = ccw(a[0], a[1], b[0], b[1], c[0], c[1]);
+    const d4 = ccw(a[0], a[1], b[0], b[1], d[0], d[1]);
+    return (d1 > 0) !== (d2 > 0) && (d3 > 0) !== (d4 > 0);
+  }
+  // Do two strokes (polylines, given as world vertex lists) cross anywhere?
+  function strokesCross(p, q) {
+    for (let i = 0; i + 1 < p.length; i++)
+      for (let j = 0; j + 1 < q.length; j++)
+        if (segCross(p[i], p[i + 1], q[j], q[j + 1])) return true;
+    return false;
+  }
+
+  // --- Union-find over the input strokes. ---
+  function buildComponents(world) {
+    const parent = world.map((_, i) => i);
+    const find = (x) => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
+    for (let i = 0; i < world.length; i++)
+      for (let j = i + 1; j < world.length; j++)
+        if (strokesCross(world[i], world[j])) union(i, j);
+    // Canonical root per input index, plus a count of distinct components.
+    const comp = world.map((_, i) => find(i));
+    const count = new Set(comp).size;
+    return { comp, count };
+  }
+
+  // The connected component a site belongs to, or null if unattributable.
+  // A segment site keeps its stroke's input index through either surviving
+  // endpoint; the synthesized point where two strokes cross has null provenance
+  // and is intentionally left unattributed (it is interior to a merged shape).
+  const siteComponent = (s, comp) => {
+    if (s.type === "segment") {
+      const idx = s.segment?.[0]?.input ?? s.segment?.[1]?.input ?? null;
+      return idx === null ? null : comp[idx];
+    }
+    if (s.type === "point") return s.source ? comp[s.source.input] : null;
+    return null; // infinite
+  };
+
+  // A stable, well-spread hue per component (golden-angle hashing of the root).
+  const hueOf = (root) => Math.floor((root * 137.508) % 360);
+
+  function draw(world, comp, sep) {
+    ctx.clearRect(0, 0, W, H);
+    // Strokes, colored by the component (compound shape) they belong to.
+    for (let k = 0; k < world.length; k++) {
+      const pts = world[k], hue = hueOf(comp[k]);
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.strokeStyle = `hsla(${hue}, 75%, 65%, 0.85)`; ctx.lineWidth = 3; ctx.stroke();
+      // Endpoints, so individual strokes within a merged component stay legible.
+      for (const [x, y] of [pts[0], pts[pts.length - 1]]) {
+        ctx.fillStyle = `hsla(${hue}, 75%, 72%, 0.9)`;
+        ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    // Separation network between *different* compound shapes.
+    const far = W * 2;
+    ctx.save();
+    ctx.shadowColor = "#22c55e"; ctx.shadowBlur = 8;
+    ctx.strokeStyle = "#34d399"; ctx.lineWidth = 1.75;
+    ctx.beginPath();
+    for (const e of sep) {
+      const pts = tessellate(e.geometry, { parabolaSamples: 20, infiniteLength: far });
+      if (pts.length < 2) continue;
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // --- Animation loop: recompute everything each frame. ---
+  let last = performance.now(), emaMs = 0;
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+
+    step(dt);
+    const world = strokes.map(worldOf);
+    const { comp, count } = buildComponents(world);
+
+    const t0 = performance.now();
+    const { edges } = voronoi({ segments: world });
+    // Keep only bisectors between two different connected components.
+    const sep = edges.filter((e) => {
+      const a = siteComponent(e.sites[0], comp), b = siteComponent(e.sites[1], comp);
+      return a !== null && b !== null && a !== b;
+    });
+    emaMs = emaMs ? emaMs * 0.9 + (performance.now() - t0) * 0.1 : (performance.now() - t0);
+
+    draw(world, comp, sep);
+    hud.textContent =
+      `${N} crossing strokes → ${count} compound shape${count === 1 ? "" : "s"}\n` +
+      `voronoi(): ${emaMs.toFixed(1)} ms  (~${(1000 / Math.max(emaMs, 1)).toFixed(0)} fps cap)\n` +
+      `separating edges: ${sep.length} / ${edges.length}`;
+
+    requestAnimationFrame(frame);
+  }
+  await init();
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

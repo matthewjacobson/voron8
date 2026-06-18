@@ -6,7 +6,8 @@ The segment **Voro**noi diagram of points, segments, and polygons, computed by [
 
 - **[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)**
 - **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive))
-- **[Compound-Voronoi demo →](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html)** (live soft-body blobs)
+- **[Compound-Voronoi demo →](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html)** (live soft-body blobs, points & open segments — disjoint mixed input)
+- **[Connected-component demo →](https://matthewjacobson.github.io/voron8/example/compound-connected.html)** (overlapping strokes that merge into compound shapes when they cross)
 - **[CDN/UMD demo →](https://matthewjacobson.github.io/voron8/example/cdn-umd.html)** (no build step)
 
 Give it any mix of points, open segments, and closed polygons; get back a graph of Voronoi vertices and edges where:
@@ -196,7 +197,9 @@ const separating = edges.filter((e) => {
 });
 ```
 
-(A segment site's two endpoints are consecutive vertices of the same input, so either one gives its index; endpoints read `null` only for points CGAL synthesized, e.g. where two segments cross.) The live [compound-Voronoi demo](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html) animates a set of morphing soft-body blobs and redraws this separation network every frame.
+(A segment site's two endpoints are consecutive vertices of the same input, so either one gives its index; endpoints read `null` only for points CGAL synthesized, e.g. where two segments cross.) The live [compound-Voronoi demo](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html) animates a mix of morphing soft-body blobs, open segments, and points — kept disjoint — and redraws this separation network every frame.
+
+When inputs are allowed to **overlap**, "which shape did this come from" is no longer one input index. The [connected-component demo](https://matthewjacobson.github.io/voron8/example/compound-connected.html) handles that by grouping the inputs into connected components (union-find over shared endpoints and crossings) and treating each component as one compound shape: separators are drawn only between *different* components, so where two strokes cross they merge into a single shape and the boundary between them disappears. This also sidesteps the synthesized crossing point's `null` provenance — that point is interior to the merged shape, so the ambiguous edges around it are exactly the ones that correctly drop out.
 
 ## Why an input vertex shows up as a Voronoi vertex
 

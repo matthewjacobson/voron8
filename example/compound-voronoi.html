@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
-    <title>voron8 — Compound Voronoi (live, morphing)</title>
+    <title>voron8 — Compound Voronoi (mixed input, live)</title>
     <style>
       html, body { margin: 0; height: 100%; background: #0b0f14; }
       body { display: grid; place-items: center; }
@@ -12,11 +12,14 @@
         font: 12px/1.4 ui-monospace, Menlo, monospace; color: #5b6b7a;
         pointer-events: none; white-space: pre;
       }
+      #nav { position: fixed; top: 10px; right: 14px; font: 12px ui-monospace, Menlo, monospace; }
+      #nav a { color: #60a5fa; text-decoration: none; }
     </style>
 </head>
 <body>
 <canvas id="c" width="800" height="800"></canvas>
 <pre id="hud"></pre>
+<nav id="nav"><a href="./compound-connected.html">Connected-component demo →</a> · <a href="./">Voronoi demo →</a></nav>
 <script type="module">
   import { init, voronoi, tessellate } from "../dist/voron8.js";
 
@@ -25,16 +28,21 @@
   const ctx = canvas.getContext("2d");
   const hud = document.getElementById("hud");
 
-  // --- The input a site originates from, or null if unattributable. ---
-  const sitePolygon = (s) => {
+  // --- The input a site originates from, or null if unattributable. Works for
+  //     every site kind: a point site carries its own source; a segment site is
+  //     attributed by either surviving endpoint (one reads null only where two
+  //     segments cross, which can't happen here — bodies are kept disjoint). ---
+  const siteShape = (s) => {
     if (s.type === "point")   return s.source ? s.source.input : null;
     if (s.type === "segment") return s.segment?.[0]?.input ?? s.segment?.[1]?.input ?? null;
     return null; // infinite
   };
-  // True when an edge is the bisector between two *different* input polygons.
-  const separatesPolygons = (e) => {
+  // True when an edge is the bisector between two *different* input shapes —
+  // a point, an open segment, or a polygon. This is the compound-Voronoi
+  // partition, now over a mix of site kinds rather than polygons alone.
+  const separatesShapes = (e) => {
     const [a, b] = e.sites;
-    const pa = sitePolygon(a), pb = sitePolygon(b);
+    const pa = siteShape(a), pb = siteShape(b);
     return pa !== null && pb !== null && pa !== pb;
   };
 
@@ -51,7 +59,14 @@
   //                     so the ring stays a simple, non-self-intersecting polygon
   //                     and can't collapse. Anchors are stiffer than edges.
   // The blob's CENTER moves separately (drift / wall-bounce / mutual repulsion).
-  const N = 9;
+  // The scene is a mix of input kinds, all sharing the same locomotion +
+  // mutual-repulsion system so they stay disjoint (clean per-shape provenance):
+  //   • 7 soft-body POLYGONS (closed rings, as before),
+  //   • 2 open POLYLINES   (a soft-body ring emitted/drawn without its closing
+  //                         edge → a curved open stroke), and
+  //   • 3 isolated POINTS  (single moving sites).
+  const N_POLY = 7, N_LINE = 2, N_POINT = 3;
+  const N = N_POLY + N_LINE;            // ring-like bodies (polygons + polylines)
   const K_ANCHOR = 34;          // anchor stiffness — kept above peak edge stiffness
                                 // (14×1.55≈22) so anchors stay dominant → no self-intersection
   const K_EDGE_BASE = 14;       // baseline edge stiffness
@@ -60,7 +75,10 @@
 
   const blobs = [];
   for (let k = 0; k < N; k++) {
-    const sides = 9 + Math.floor(rnd() * 4);            // 9–12 vertices
+    const kind = k < N_LINE ? "polyline" : "polygon";
+    const sides = kind === "polyline"
+      ? 5 + Math.floor(rnd() * 3)                       // 5–7 vertices → open arc
+      : 9 + Math.floor(rnd() * 4);                      // 9–12 vertices
     const baseR = 36 + rnd() * 26;
     const theta = [], baseRad = [], radPhase = [], lenPhase = [], kPhase = [];
     const lx = [], ly = [], vx = [], vy = [];
@@ -81,6 +99,7 @@
     }
     const R = Math.max(...baseRad);
     blobs.push({
+      kind,
       x: R + rnd() * (W - 2 * R), y: R + rnd() * (H - 2 * R),
       vx: (rnd() * 2 - 1) * 55, vy: (rnd() * 2 - 1) * 55,
       angle: rnd() * Math.PI * 2, spin: (rnd() * 2 - 1) * 0.5,
@@ -89,6 +108,16 @@
       R, hue: Math.floor(rnd() * 360),
       // independent slow rates per blob so they don't morph in lock-step
       radW: 0.18 + rnd() * 0.22, lenW: 0.22 + rnd() * 0.25, kW: 0.10 + rnd() * 0.18,
+    });
+  }
+  // Isolated point bodies — just a moving center with a small clearance radius.
+  for (let k = 0; k < N_POINT; k++) {
+    const R = 7;
+    blobs.push({
+      kind: "point",
+      x: R + rnd() * (W - 2 * R), y: R + rnd() * (H - 2 * R),
+      vx: (rnd() * 2 - 1) * 70, vy: (rnd() * 2 - 1) * 70,
+      R, hue: Math.floor(rnd() * 360),
     });
   }
 
@@ -151,8 +180,11 @@
   };
 
   function step(dt, t) {
-    // Morph + relax each blob's shape.
-    for (const b of blobs) { softBody(b, t); b.angle += b.spin * dt; }
+    // Morph + relax each ring-like body's shape (points have no soft body).
+    for (const b of blobs) {
+      if (b.kind === "point") continue;
+      softBody(b, t); b.angle += b.spin * dt;
+    }
 
     // Global locomotion of the centers.
     for (const b of blobs) { b.x += b.vx * dt; b.y += b.vy * dt; }
@@ -162,9 +194,10 @@
       if (b.y - b.R < 0) { b.y = b.R;     b.vy =  Math.abs(b.vy); }
       if (b.y + b.R > H) { b.y = H - b.R; b.vy = -Math.abs(b.vy); }
     }
-    // Soft mutual repulsion keeps bounding circles disjoint → input polygons
+    // Soft mutual repulsion keeps bounding circles disjoint → input shapes
     // stay separate → clean site provenance, no gaps in the separation network.
-    for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+    // Covers every body (polygons, polylines, AND points) so nothing overlaps.
+    for (let i = 0; i < blobs.length; i++) for (let j = i + 1; j < blobs.length; j++) {
       const a = blobs[i], b = blobs[j];
       const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1e-3, min = a.R + b.R + 10;
       if (d < min) {
@@ -176,16 +209,28 @@
     }
   }
 
-  function draw(polys, sep) {
+  function draw(sep) {
     ctx.clearRect(0, 0, W, H);
-    for (let k = 0; k < polys.length; k++) {
-      const ring = polys[k], hue = blobs[k].hue;
+    // Each body drawn by kind: polygons filled+closed, polylines as open
+    // strokes, points as dots.
+    for (const b of blobs) {
+      const hue = b.hue;
+      if (b.kind === "point") {
+        ctx.fillStyle = `hsla(${hue}, 70%, 65%, 0.85)`;
+        ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI * 2); ctx.fill();
+        continue;
+      }
+      const ring = ringOf(b);
       ctx.beginPath();
       ctx.moveTo(ring[0][0], ring[0][1]);
       for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i][0], ring[i][1]);
-      ctx.closePath();
-      ctx.fillStyle = `hsla(${hue}, 70%, 55%, 0.12)`; ctx.fill();
-      ctx.strokeStyle = `hsla(${hue}, 70%, 65%, 0.55)`; ctx.lineWidth = 1.5; ctx.stroke();
+      if (b.kind === "polygon") {
+        ctx.closePath();
+        ctx.fillStyle = `hsla(${hue}, 70%, 55%, 0.12)`; ctx.fill();
+        ctx.strokeStyle = `hsla(${hue}, 70%, 65%, 0.55)`; ctx.lineWidth = 1.5; ctx.stroke();
+      } else { // polyline — open stroke, no fill, no closing edge
+        ctx.strokeStyle = `hsla(${hue}, 70%, 70%, 0.7)`; ctx.lineWidth = 2.5; ctx.stroke();
+      }
     }
     const far = W * 2;
     ctx.save();
@@ -210,17 +255,24 @@
     last = now;
 
     step(dt, now / 1000);
-    const polys = blobs.map(ringOf);
+
+    // Assemble the mixed input. Flatten order — points, then segments, then
+    // polygons — is what `source.input` indexes into; siteShape() relies on it.
+    const points = [], segments = [], polygons = [];
+    for (const b of blobs) {
+      if (b.kind === "point") points.push([b.x, b.y]);
+      else if (b.kind === "polyline") segments.push(ringOf(b)); // open chain
+      else polygons.push(ringOf(b));
+    }
 
     const t0 = performance.now();
-    const { edges } = voronoi(polys);
-    const sep = edges.filter(separatesPolygons);
+    const { edges } = voronoi({ points, segments, polygons });
+    const sep = edges.filter(separatesShapes);
     emaMs = emaMs ? emaMs * 0.9 + (performance.now() - t0) * 0.1 : (performance.now() - t0);
 
-    draw(polys, sep);
-    const segs = polys.reduce((a, p) => a + p.length, 0);
+    draw(sep);
     hud.textContent =
-      `${N} morphing blobs · ${segs} segments\n` +
+      `${polygons.length} polygons · ${segments.length} segments · ${points.length} points\n` +
       `voronoi(): ${emaMs.toFixed(1)} ms  (~${(1000 / Math.max(emaMs, 1)).toFixed(0)} fps cap)\n` +
       `separating edges: ${sep.length} / ${edges.length}`;
 
