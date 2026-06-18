@@ -32,6 +32,9 @@
 #include <emscripten/val.h>
 
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <cstdint>
 #include <vector>
 #include <utility>
 
@@ -91,6 +94,17 @@ std::pair<const void*, const void*> edge_key(const SDG& sdg, const SDG::Edge& e)
   const void* b = &*e.first->vertex(sdg.cw(e.second));
   return a < b ? std::make_pair(a, b) : std::make_pair(b, a);
 }
+
+// Hash for edge_key()'s pointer pair, so the edge index map can be an
+// unordered_map (O(1) lookups instead of O(log E)) — it is hit once per
+// boundary halfedge across the faces and group emitters.
+struct EdgeKeyHash {
+  std::size_t operator()(const std::pair<const void*, const void*>& k) const {
+    const std::size_t a = std::hash<const void*>()(k.first);
+    const std::size_t b = std::hash<const void*>()(k.second);
+    return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2));
+  }
+};
 
 } // namespace
 
@@ -238,7 +252,7 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
 
   // Maps an undirected Delaunay edge to its emitted index, so a face's boundary
   // halfedges (he->dual()) can reference edges[] instead of duplicating geometry.
-  std::map<std::pair<const void*, const void*>, int> edgeIndex;
+  std::unordered_map<std::pair<const void*, const void*>, int, EdgeKeyHash> edgeIndex;
 
   emscripten::val edges = emscripten::val::array();
   int eIdx = 0;
@@ -377,8 +391,8 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     // Label every cell. A VD face is identified by its site vertex (face->dual()
     // is stable), so we key by that. Cells whose site has an input take that
     // input's label; crossing-point cells start unlabeled (id -1).
-    std::map<const void*, int> groupId;
-    std::map<const void*, std::vector<const void*>> nbrs;  // unlabeled adjacency
+    std::unordered_map<const void*, int> groupId;
+    std::unordered_map<const void*, std::vector<const void*>> nbrs;  // unlabeled adjacency
     std::vector<const void*> unlabeled;
     for (auto fit = vd.faces_begin(); fit != vd.faces_end(); ++fit) {
       const int in = site_input(fit->dual());
@@ -415,57 +429,75 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     int nextId = static_cast<int>(idToLabel.size());
     for (const void* f : unlabeled) if (groupId[f] == -1) groupId[f] = nextId++;
 
+    const int K = static_cast<int>(idToLabel.size());
     auto labelOf = [&](VD::Halfedge_handle h) { return groupId[&*h->face()->dual()]; };
+    auto edgeOf = [&](VD::Halfedge_handle h) -> int {
+      auto it = edgeIndex.find(edge_key(sdg, h->dual()));
+      return it == edgeIndex.end() ? -1 : it->second;
+    };
 
-    // Trace each caller group's outline. A directed halfedge is on group gid's
-    // outline iff its cell is in gid and its twin's cell is not; advance by
-    // turning into adjacent same-group cells. A group may yield several rings.
-    for (int gid = 0; gid < static_cast<int>(idToLabel.size()); ++gid) {
-      emscripten::val rings = emscripten::val::array();
-      int rIdx = 0;
-      std::set<int> usedEdge;  // frontier edges already placed in a ring of gid
-      for (auto h = vd.halfedges_begin(); h != vd.halfedges_end(); ++h) {
-        VD::Halfedge_handle start = h;
-        if (labelOf(start) != gid || labelOf(start->opposite()) == gid) continue;
-        auto sk = edgeIndex.find(edge_key(sdg, start->dual()));
-        if (sk != edgeIndex.end() && usedEdge.count(sk->second)) continue;
+    // Trace every group's outline in ONE pass, driven by faces + ccb circulators
+    // (cheap — the same traversal the faces emitter uses) rather than the global
+    // halfedge iterator with per-halfedge face/opposite navigation. A ccb
+    // halfedge is on its face's group outline iff the bisector's *other* site
+    // (he->up()/down(), avoiding opposite()->face()->dual()) is in a different
+    // group; from there we walk the ring, turning into adjacent same-group cells.
+    // Each (frontier edge, gid) pair is walked once (tracked in `seen`), so this
+    // is O(E) regardless of the label count.
+    std::vector<emscripten::val> groupRings(K);
+    std::vector<int> ringCount(K, 0);
+    for (int i = 0; i < K; ++i) groupRings[i] = emscripten::val::array();
+    std::unordered_set<uint64_t> seen;  // key = edgeIndex * K + gid
+    for (auto fit = vd.faces_begin(); fit != vd.faces_end(); ++fit) {
+      auto sF = fit->dual();                         // this cell's site
+      const int gid = groupId[&*sF];
+      if (gid < 0 || gid >= K) continue;             // singleton/junction cells own no group
+      VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
+      do {
+        VD::Halfedge_handle h = ccb;
+        auto nb = (h->up() == sF) ? h->down() : h->up();  // neighbour cell's site
+        if (groupId[&*nb] == gid) continue;          // interior edge, not a frontier
+        const int e0 = edgeOf(h);
+        if (e0 < 0) continue;                         // unreferenced edge — defensive
+        if (!seen.insert(static_cast<uint64_t>(e0) * K + gid).second) continue;  // ring done
 
-        std::vector<VD::Halfedge_handle> hs;
-        VD::Halfedge_handle e = start;
+        std::vector<std::pair<VD::Halfedge_handle, int>> hs;  // (halfedge, edge index)
+        VD::Halfedge_handle e = h;
         int guard = 0;
         do {
-          hs.push_back(e);
+          const int ei = edgeOf(e);
+          hs.emplace_back(e, ei);
+          if (ei >= 0) seen.insert(static_cast<uint64_t>(ei) * K + gid);
           VD::Halfedge_handle n = e->next();
           while (labelOf(n->opposite()) == gid) n = n->opposite()->next();
           e = n;
-        } while (e != start && ++guard < 1000000);
+        } while (e != h && ++guard < 1000000);
 
         // Open an unbounded outline at infinity, like a cell boundary, so its
         // two rays end up first and last.
         bool unbounded = false;
         int startAt = 0;
         for (std::size_t i = 0; i < hs.size(); ++i) {
-          if (!hs[i]->has_source() || !hs[i]->has_target()) unbounded = true;
-          if (!hs[i]->has_source()) startAt = static_cast<int>(i);
+          if (!hs[i].first->has_source() || !hs[i].first->has_target()) unbounded = true;
+          if (!hs[i].first->has_source()) startAt = static_cast<int>(i);
         }
         emscripten::val boundary = emscripten::val::array();
         int bi = 0;
         for (std::size_t k = 0; k < hs.size(); ++k) {
-          VD::Halfedge_handle he = hs[(startAt + k) % hs.size()];
-          auto it = edgeIndex.find(edge_key(sdg, he->dual()));
-          if (it == edgeIndex.end()) continue;
-          usedEdge.insert(it->second);
-          boundary.set(bi++, it->second);
+          const int ei = hs[(startAt + k) % hs.size()].second;
+          if (ei >= 0) boundary.set(bi++, ei);
         }
 
         emscripten::val r = emscripten::val::object();
         r.set("unbounded", unbounded);
         r.set("boundary", boundary);
-        rings.set(rIdx++, r);
-      }
+        groupRings[gid].set(ringCount[gid]++, r);
+      } while (++ccb != done);
+    }
+    for (int gid = 0; gid < K; ++gid) {
       emscripten::val g = emscripten::val::object();
       g.set("label", idToLabel[gid]);
-      g.set("rings", rings);
+      g.set("rings", groupRings[gid]);
       groups.set(gid, g);
     }
   }

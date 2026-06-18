@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.1] - 2026-06-18
+
+### Fixed
+
+- Passing `labels` to `voronoi()` was far slower than it should be and got
+  worse with more distinct labels — the group-outline tracer rescanned every
+  halfedge once per group (O(labels × edges)). It now traces all groups in a
+  single faces/ccb-driven pass, independent of the label count. On a 100-segment
+  diagram with one label per input this drops the call from ~13 s to ~0.5 s; the
+  remaining overhead over an unlabeled call is a flat ~2.3× (a second pass over
+  the diagram plus emitting the outlines). Output is unchanged.
+
 ## [3.1.0] - 2026-06-18
 
 ### Added
@@ -117,6 +129,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   WebAssembly, with interior/exterior edge labeling, input-vertex provenance,
   `medialAxis()`, and `tessellate()`.
 
+[3.1.1]: https://github.com/matthewjacobson/voron8/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/matthewjacobson/voron8/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/matthewjacobson/voron8/compare/v2.0.3...v3.0.0
 [2.0.3]: https://github.com/matthewjacobson/voron8/compare/v2.0.2...v2.0.3
