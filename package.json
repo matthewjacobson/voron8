@@ -1,6 +1,6 @@
 {
   "name": "voron8",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "description": "CGAL segment Voronoi diagram of points, segments, and polygons, in WebAssembly — edges labeled interior/exterior, vertices traced back to input geometry.",
   "repository": {
     "type": "git",
