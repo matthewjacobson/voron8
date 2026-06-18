@@ -2,17 +2,17 @@
 
 [![CI](https://github.com/matthewjacobson/voron8/actions/workflows/ci.yml/badge.svg)](https://github.com/matthewjacobson/voron8/actions/workflows/ci.yml)
 
-The segment **Voro**noi diagram of polygons, computed by [CGAL](https://www.cgal.org/) and shipped as WebAssembly.
+The segment **Voro**noi diagram of points, segments, and polygons, computed by [CGAL](https://www.cgal.org/) and shipped as WebAssembly.
 
 - **[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)**
 - **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive))
 - **[Compound-Voronoi demo →](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html)** (live soft-body blobs)
 - **[CDN/UMD demo →](https://matthewjacobson.github.io/voron8/example/cdn-umd.html)** (no build step)
 
-Give it an array of polygons; get back a graph of Voronoi vertices and edges where:
+Give it any mix of points, open segments, and closed polygons; get back a graph of Voronoi vertices and edges where:
 
-- **every edge is labeled `interior` or `exterior`** relative to the even-odd filled input region (so it doubles as a medial-axis / shape-skeleton extractor), and
-- **every vertex that coincides with an original polygon corner is traced back** to its `{ polygon, vertex }` source.
+- **every edge is labeled `interior` or `exterior`** relative to the even-odd filled region of the polygons (so it doubles as a medial-axis / shape-skeleton extractor), and
+- **every vertex that coincides with an original input vertex is traced back** to its `{ input, vertex }` source.
 
 The published package is a single ES module with the wasm embedded as base64 — nothing extra to host, no native toolchain to install.
 
@@ -37,10 +37,10 @@ const square = [
 
 const { vertices, edges } = voronoi(square);
 
-// Which Voronoi vertices are original polygon corners?
+// Which Voronoi vertices are original input vertices?
 for (const v of vertices) {
   if (v.isInput) {
-    console.log(`corner ${v.source.polygon}:${v.source.vertex} at (${v.x}, ${v.y})`);
+    console.log(`corner ${v.source.input}:${v.source.vertex} at (${v.x}, ${v.y})`);
   }
 }
 
@@ -87,13 +87,33 @@ For a classic `<script>` tag, load the UMD build from a CDN; it exposes a global
 ## Input
 
 ```ts
-type Polygon = Point[] | Array<[number, number]>;
-voronoi(polygons: Polygon[]): VoronoiResult; // await init() once first
+type Polygon  = Point[] | Array<[number, number]>; // closed ring
+type Polyline = Point[] | Array<[number, number]>; // open chain (>= 2 points)
+
+interface SiteInput {
+  points?:   Array<Point | [number, number]>; // isolated points
+  segments?: Polyline[];                       // open segments / polylines
+  polygons?: Polygon[];                        // closed rings
+}
+
+voronoi(input: Polygon[] | SiteInput): VoronoiResult; // await init() once first
 ```
 
-- Each polygon is a closed ring of vertices (do **not** repeat the first point at the end).
-- Pass multiple rings to compute one diagram over all of them at once.
-- **Holes:** interior/exterior labeling uses the even-odd fill rule, so a ring nested inside another acts as a hole — edges inside the hole are labeled `exterior`.
+You can pass any mix of site kinds:
+
+```js
+voronoi({
+  points:   [[5, 5]],
+  segments: [[ [0, 0], [4, 4] ]], // a single open segment
+  polygons: [ square ],           // closed ring(s)
+});
+```
+
+- A bare array of rings is shorthand for `{ polygons }` — the original API is unchanged.
+- Each **polygon** is a closed ring (do **not** repeat the first point at the end); each **segment** is an open chain that is *not* closed; a two-point chain is a single line segment.
+- Sites flatten into one ordered list — **points, then segments, then polygons** — and `source.input` (below) indexes into that list. With the bare-array form, `input` is just the ring index.
+- **Holes / interior:** interior/exterior labeling uses the even-odd fill rule over the **polygons only** (points and open segments enclose no region). A ring nested inside another acts as a hole — edges inside it are `exterior`.
+- **Crossing segments** are allowed: where two segment interiors cross, CGAL inserts the intersection as a new point site. That site is not an input vertex, so it appears with `isInput: false` and a `null` source.
 
 ## Output
 
@@ -106,8 +126,8 @@ interface VoronoiResult {
 interface VoronoiVertex {
   x: number;
   y: number;
-  isInput: boolean;                                   // coincides with a polygon corner?
-  source: { polygon: number; vertex: number } | null; // where it came from, if so
+  isInput: boolean;                                  // coincides with an input vertex?
+  source: { input: number; vertex: number } | null; // where it came from, if so
 }
 
 interface VoronoiEdge {
@@ -120,11 +140,11 @@ interface VoronoiEdge {
 
 interface SiteRef {
   type: "point" | "segment" | "infinite";
-  source: VertexRef | null;                          // set for input corners (point sites)
+  source: VertexRef | null;                          // set for input vertices (point sites)
   segment: [VertexRef | null, VertexRef | null] | null; // endpoints (segment sites)
 }
 
-interface VertexRef { polygon: number; vertex: number; }
+interface VertexRef { input: number; vertex: number; }
 ```
 
 `EdgeGeometry` is a tagged union — the segment Voronoi diagram has both straight and curved bisectors:
@@ -150,37 +170,37 @@ Returns a polyline. Straight edges return their two endpoints; parabolic arcs ar
 ### Medial axis
 
 ```ts
-medialAxis(polygons: Polygon[]): Promise<VoronoiResult>;
+medialAxis(input: Polygon[] | SiteInput): VoronoiResult; // await init() once first
 ```
 
-The interior **medial axis** (skeleton) of the filled region: every interior Voronoi edge *except* the degenerate bisectors between a polygon vertex and one of its own incident edges. Because CGAL treats each segment endpoint as its own site, those incident pairs produce perpendicular bisectors that touch the boundary at a single point and aren't part of the skeleton. Everything else is kept — including the parabolic arcs between a reflex vertex and the wall facing it, and bisectors between two reflex vertices. The result shares the same `vertices` as `voronoi()` (so `from`/`to` indices stay valid) with `edges` narrowed to the medial axis.
+The interior **medial axis** (skeleton) of the filled region: every interior Voronoi edge *except* the degenerate bisectors between a polygon vertex and one of its own incident edges. Because CGAL treats each segment endpoint as its own site, those incident pairs produce perpendicular bisectors that touch the boundary at a single point and aren't part of the skeleton. Everything else is kept — including the parabolic arcs between a reflex vertex and the wall facing it, and bisectors between two reflex vertices. The result shares the same `vertices` as `voronoi()` (so `from`/`to` indices stay valid) with `edges` narrowed to the medial axis. The axis is defined by the **polygons** in the input; points and open segments still perturb the diagram as sites but enclose no region, so an input with no polygons yields an empty axis.
 
 The interactive [medial-axis demo](https://matthewjacobson.github.io/voron8/example/medial-axis.html) runs this over shapes from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive), with three sliders that feature-prune the axis. The pruning follows the rooted-tree model of [micycle1's PGS `MedialAxis`](https://github.com/micycle1/PGS/blob/8231057/src/main/java/micycle/pgs/PGS_Contour.java): the axis is rooted at its widest disk, and three normalized 0..1 thresholds prune it — **axial** (per-edge gradient `d(radius)/d(length)`), **distance** (geodesic distance from the root), and **area** (a subtree's aggregate feature area, normalized per connected component) — each cutting an edge and its whole subtree. It's plain client-side code in [`example/prune.js`](example/prune.js); voron8 itself returns the unpruned axis.
 
 ### Edges that separate two polygons
 
-When you pass several polygons at once, the edges whose two sites come from *different* polygons trace the boundary between them — the compound-Voronoi partition. Every edge already carries the two `sites` it bisects, and each site knows the polygon it came from, so you can filter for these directly — no need to inspect `from`/`to` (those index the edge's *endpoints*, not the cells it divides):
+When you pass several inputs at once, the edges whose two sites come from *different* inputs trace the boundary between them — the compound-Voronoi partition. Every edge already carries the two `sites` it bisects, and each site knows the input it came from (`source.input`), so you can filter for these directly — no need to inspect `from`/`to` (those index the edge's *endpoints*, not the cells it divides):
 
 ```js
-// The polygon a site originates from, or null if it can't be attributed.
-const sitePolygon = (s) =>
-  s.type === "point"   ? (s.source?.polygon ?? null) :
-  s.type === "segment" ? (s.segment?.[0]?.polygon ?? s.segment?.[1]?.polygon ?? null) :
+// The input a site originates from, or null if it can't be attributed.
+const siteInput = (s) =>
+  s.type === "point"   ? (s.source?.input ?? null) :
+  s.type === "segment" ? (s.segment?.[0]?.input ?? s.segment?.[1]?.input ?? null) :
   null; // infinite
 
-const { edges } = await voronoi(polygons);
+const { edges } = voronoi(polygons);
 const separating = edges.filter((e) => {
   const [a, b] = e.sites;
-  const pa = sitePolygon(a), pb = sitePolygon(b);
+  const pa = siteInput(a), pb = siteInput(b);
   return pa !== null && pb !== null && pa !== pb;
 });
 ```
 
-(A segment site's two endpoints are consecutive vertices of the same ring, so either one gives its polygon; endpoints read `null` only for points CGAL synthesized, e.g. where two input rings cross.) The live [compound-Voronoi demo](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html) animates a set of morphing soft-body blobs and redraws this separation network every frame.
+(A segment site's two endpoints are consecutive vertices of the same input, so either one gives its index; endpoints read `null` only for points CGAL synthesized, e.g. where two segments cross.) The live [compound-Voronoi demo](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html) animates a set of morphing soft-body blobs and redraws this separation network every frame.
 
-## Why a polygon corner shows up as a Voronoi vertex
+## Why an input vertex shows up as a Voronoi vertex
 
-In the segment Voronoi diagram each polygon **edge** and each polygon **corner** is a site. Two edges meeting at a corner are both zero distance from that corner, so the corner is itself a Voronoi vertex — which is why `voronoi()` can hand its provenance straight back to you via `source`.
+In the segment Voronoi diagram each segment and each endpoint/corner is a site. Two segments meeting at a shared vertex are both zero distance from it, so that vertex is itself a Voronoi vertex — which is why `voronoi()` can hand its provenance straight back to you via `source`.
 
 ## Building from source
 

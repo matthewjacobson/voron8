@@ -1,11 +1,12 @@
 // voron8 — public API.
 //
-// voronoi(polygons) builds the CGAL segment Voronoi diagram of the polygon
-// edges and returns a graph of vertices and edges. Each edge is labeled
-// "interior" or "exterior" w.r.t. the even-odd filled region of the input, and
-// each vertex that coincides with an original polygon corner is traced back to
-// its { polygon, vertex } source. tessellate() turns any edge — including the
-// curved parabolic bisectors — into a polyline.
+// voronoi(input) builds the CGAL segment Voronoi diagram of the input sites —
+// isolated points, open segments/polylines, and closed polygons — and returns a
+// graph of vertices and edges. Each edge is labeled "interior" or "exterior"
+// w.r.t. the even-odd filled region of the *polygons* (points and open segments
+// define no interior), and each vertex that coincides with an original input
+// vertex is traced back to its { input, vertex } source. tessellate() turns any
+// edge — including the curved parabolic bisectors — into a polyline.
 
 // @ts-ignore — generated single-file Emscripten ESM module (no types).
 import createVoron8Module from "./core/voronoi.js";
@@ -18,11 +19,30 @@ export interface Point {
 /** A ring of vertices. Treated as closed: the last point connects to the first. */
 export type Polygon = Point[] | Array<[number, number]>;
 
+/** An open polyline (>= 2 points). A 2-point polyline is a single segment. */
+export type Polyline = Point[] | Array<[number, number]>;
+
+/**
+ * The general input to voronoi()/medialAxis() — any mix of site kinds. The
+ * sites are flattened into a single ordered list, in this order: every point,
+ * then every segment, then every polygon. `source.input` (below) indexes into
+ * that flattened list. Passing a bare `Polygon[]` is shorthand for
+ * `{ polygons }`, so the array form's input indices equal the ring indices.
+ */
+export interface SiteInput {
+  /** Isolated point sites. */
+  points?: Array<Point | [number, number]>;
+  /** Open polyline sites (each >= 2 points; a 2-point polyline is a segment). */
+  segments?: Polyline[];
+  /** Closed polygon sites (nested rings act as holes under even-odd fill). */
+  polygons?: Polygon[];
+}
+
 export interface VoronoiVertex extends Point {
-  /** True if this Voronoi vertex coincides with an input polygon corner. */
+  /** True if this Voronoi vertex coincides with an input vertex. */
   isInput: boolean;
   /** Provenance when isInput; null otherwise. */
-  source: { polygon: number; vertex: number } | null;
+  source: { input: number; vertex: number } | null;
 }
 
 /** A straight finite bisector between two sites. */
@@ -65,16 +85,18 @@ export type EdgeGeometry =
   | LineGeometry
   | ParabolaGeometry;
 
-/** A reference back to an original polygon vertex. */
+/** A reference back to an original input vertex (see `SiteInput` for ordering). */
 export interface VertexRef {
-  polygon: number;
+  /** Index into the flattened input site list. */
+  input: number;
+  /** Index of the vertex within that site (always 0 for a point). */
   vertex: number;
 }
 
 /**
  * One of the two input sites whose bisector an edge is.
- * - `point`: `source` is its `{ polygon, vertex }` when it is an original
- *   polygon corner (null for e.g. a segment-intersection point).
+ * - `point`: `source` is its `{ input, vertex }` when it is an original input
+ *   vertex (null for e.g. a point where two segments cross).
  * - `segment`: `segment` holds the provenance of its two endpoints (each a
  *   `VertexRef` or null), so callers can test incidence with a point site.
  * - `infinite`: the site at infinity; both fields are null.
@@ -103,7 +125,7 @@ export interface VoronoiResult {
 }
 
 type WasmModule = {
-  computeVoronoi: (coords: number[], ringSizes: number[]) => {
+  computeVoronoi: (coords: number[], ringSizes: number[], closed: number[]) => {
     vertices: VoronoiVertex[];
     edges: Array<{ sites: [SiteRef, SiteRef] } & Record<string, any>>;
   };
@@ -170,7 +192,7 @@ function insideFilledRegion(
 }
 
 function sameVertex(a: VertexRef | null, b: VertexRef | null): boolean {
-  return a !== null && b !== null && a.polygon === b.polygon && a.vertex === b.vertex;
+  return a !== null && b !== null && a.input === b.input && a.vertex === b.vertex;
 }
 
 /**
@@ -205,28 +227,52 @@ function sampleOf(geom: EdgeGeometry): Point | null {
   }
 }
 
+/** Normalize either input form into a flat, ordered list of (ring, closed) sites. */
+function normalizeInput(
+  input: Polygon[] | SiteInput,
+): { sites: Array<{ ring: Array<[number, number]>; closed: boolean }>; fillRings: Array<Array<[number, number]>> } {
+  const site = Array.isArray(input) ? { polygons: input } : input;
+
+  const sites: Array<{ ring: Array<[number, number]>; closed: boolean }> = [];
+  // Flattened order must match the C++ provenance: points, then segments, then
+  // polygons. `source.input` indexes into this list.
+  for (const p of site.points ?? []) sites.push({ ring: [toXY(p)], closed: false });
+  for (const s of site.segments ?? []) sites.push({ ring: toRing(s), closed: false });
+  const polygonRings = (site.polygons ?? []).map(toRing);
+  for (const ring of polygonRings) sites.push({ ring, closed: true });
+
+  // Only closed polygons define the filled region for interior/exterior labels.
+  return { sites, fillRings: polygonRings };
+}
+
 /**
- * Compute the segment Voronoi diagram of one or more polygons.
+ * Compute the segment Voronoi diagram of a set of input sites.
  *
  * Synchronous: await init() once before calling this (it throws otherwise).
  *
- * @param polygons Array of rings. Each ring is a list of points ({x,y} or
- *                 [x,y]); rings are treated as closed. Nested rings act as holes
- *                 under the even-odd fill rule used for interior/exterior labels.
+ * @param input Either a bare array of polygon rings (shorthand for
+ *              `{ polygons }`), or a `SiteInput` object mixing `points`,
+ *              `segments` (open polylines), and `polygons` (closed rings). Each
+ *              vertex is `{x,y}` or `[x,y]`. Nested polygons act as holes under
+ *              the even-odd fill rule used for interior/exterior labels; points
+ *              and open segments define no interior.
  */
-export function voronoi(polygons: Polygon[]): VoronoiResult {
+export function voronoi(input: Polygon[] | SiteInput): VoronoiResult {
   const mod = getModule();
+
+  const { sites, fillRings } = normalizeInput(input);
 
   const coords: number[] = [];
   const ringSizes: number[] = [];
-  const rings = polygons.map(toRing);
+  const closed: number[] = [];
 
-  for (const ring of rings) {
+  for (const { ring, closed: isClosed } of sites) {
     for (const [x, y] of ring) coords.push(x, y);
     ringSizes.push(ring.length);
+    closed.push(isClosed ? 1 : 0);
   }
 
-  const raw = mod.computeVoronoi(coords, ringSizes);
+  const raw = mod.computeVoronoi(coords, ringSizes, closed);
 
   const edges: VoronoiEdge[] = raw.edges.map((e: any) => {
     let geometry: EdgeGeometry;
@@ -255,7 +301,7 @@ export function voronoi(polygons: Polygon[]): VoronoiResult {
 
     const sample = sampleOf(geometry);
     const location =
-      sample && insideFilledRegion(sample.x, sample.y, rings)
+      sample && insideFilledRegion(sample.x, sample.y, fillRings)
         ? "interior"
         : "exterior";
 
@@ -279,12 +325,16 @@ export function voronoi(polygons: Polygon[]): VoronoiResult {
  * Returns the same `vertices` as `voronoi()` (so edge `from`/`to` indices stay
  * valid) with `edges` narrowed to the medial axis.
  *
+ * The medial axis is defined by the *polygons* in the input; points and open
+ * segments still perturb the diagram as sites but contribute no interior, so an
+ * input with no polygons yields an empty axis.
+ *
  * Synchronous: await init() once before calling this (it throws otherwise).
  *
  * @see https://stackoverflow.com/questions/69237154 (Richard's CGAL answer)
  */
-export function medialAxis(polygons: Polygon[]): VoronoiResult {
-  const result = voronoi(polygons);
+export function medialAxis(input: Polygon[] | SiteInput): VoronoiResult {
+  const result = voronoi(input);
   const edges = result.edges.filter(
     (e) => e.location === "interior" && !isIncidentBisector(e),
   );

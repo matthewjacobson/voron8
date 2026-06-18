@@ -33,7 +33,7 @@ test("input polygon corners are flagged and mapped back to source", async () => 
   assert.equal(inputs.length, 4, "all four corners coincide with Voronoi vertices");
 
   for (const v of inputs) {
-    assert.equal(v.source.polygon, 0);
+    assert.equal(v.source.input, 0);
     assert.ok(v.source.vertex >= 0 && v.source.vertex < 4);
   }
   // Provenance covers each of the four corners exactly once.
@@ -122,7 +122,7 @@ test("every edge reports its two defining sites", async () => {
     for (const s of e.sites) {
       assert.ok(["point", "segment", "infinite"].includes(s.type));
       if (s.type === "point" && s.source) {
-        assert.equal(s.source.polygon, 0);
+        assert.equal(s.source.input, 0);
         assert.ok(s.source.vertex >= 0 && s.source.vertex < 4);
       } else {
         assert.equal(s.source, null);
@@ -146,7 +146,7 @@ const L_SHAPE = [
 // Whether an edge bisects a point site and a segment site incident to it
 // (a polygon vertex and one of its own edges) — the degenerate, non-medial case.
 function isIncidentBisector(e) {
-  const same = (a, b) => a && b && a.polygon === b.polygon && a.vertex === b.vertex;
+  const same = (a, b) => a && b && a.input === b.input && a.vertex === b.vertex;
   const inc = (pt, seg) =>
     pt.type === "point" &&
     seg.type === "segment" &&
@@ -258,4 +258,95 @@ test("parabolic arcs appear for non-convex input and sample on-curve", async () 
   assert.ok(
     Math.hypot(pts[23].x - g.target.x, pts[23].y - g.target.y) < 1e-9,
   );
+});
+
+// --- Generalized input: points, segments, and mixed sites. ---
+
+test("two isolated points bisect along their perpendicular", async () => {
+  const { edges } = voronoi({ points: [[0, 0], [4, 0]] });
+  assert.ok(edges.length > 0, "two points produce a bisector");
+
+  // The bisector is the infinite line x = 2; with no polygons it is exterior.
+  const bisector = edges.find(
+    (e) => e.geometry.type === "line" || e.geometry.type === "ray",
+  );
+  assert.ok(bisector, "the bisector of two points is unbounded");
+  assert.equal(bisector.location, "exterior");
+
+  // Both defining sites are the input points, traced back by input index.
+  for (const s of bisector.sites) {
+    assert.equal(s.type, "point");
+    assert.ok(s.source, "a point site carries its source");
+  }
+  const inputs = bisector.sites.map((s) => s.source.input).sort();
+  assert.deepEqual(inputs, [0, 1], "the two points are inputs 0 and 1");
+});
+
+test("an open segment is a site without enclosing any interior", async () => {
+  const { edges } = voronoi({ segments: [[[0, 0], [4, 0]]] });
+  assert.ok(edges.length > 0, "a segment produces bisectors");
+
+  // A lone open segment encloses no region, so nothing is interior.
+  for (const e of edges) assert.equal(e.location, "exterior");
+
+  // The segment itself appears as a site, alongside its two endpoint points.
+  const kinds = new Set(edges.flatMap((e) => e.sites).map((s) => s.type));
+  assert.ok(kinds.has("segment"), "the open segment is a segment site");
+  assert.ok(kinds.has("point"), "its endpoints are point sites");
+});
+
+test("mixed input flattens as points, then segments, then polygons", async () => {
+  // One stray point (input 0) plus the square (input 1) — the point comes first
+  // in the flattened ordering, so the square's corners are now input 1.
+  const { edges } = voronoi({ points: [[5, 5]], polygons: SQUARE });
+
+  const pointSites = edges
+    .flatMap((e) => e.sites)
+    .filter((s) => s.type === "point" && s.source);
+  assert.ok(
+    pointSites.some((s) => s.source.input === 0),
+    "the lone point is input 0",
+  );
+  assert.ok(
+    pointSites.some((s) => s.source.input === 1),
+    "the square's corners are input 1",
+  );
+});
+
+test("crossing segments insert a non-input intersection site", async () => {
+  // The two diagonals of a square cross at (2,2). With CGAL's intersecting
+  // traits, that crossing is inserted as a new site — but it is not an input
+  // vertex, so its provenance is null.
+  const { edges } = voronoi({
+    segments: [
+      [[0, 0], [4, 4]],
+      [[0, 4], [4, 0]],
+    ],
+  });
+  assert.ok(edges.length > 0, "crossing segments still produce a diagram");
+
+  const sites = edges.flatMap((e) => e.sites);
+  const hasNullProvenance =
+    sites.some((s) => s.type === "point" && s.source === null) ||
+    sites.some(
+      (s) =>
+        s.type === "segment" &&
+        s.segment &&
+        (s.segment[0] === null || s.segment[1] === null),
+    );
+  assert.ok(
+    hasNullProvenance,
+    "the crossing introduces a site with no input provenance",
+  );
+});
+
+test("the bare-array form is shorthand for { polygons }", async () => {
+  const fromArray = voronoi(SQUARE);
+  const fromObject = voronoi({ polygons: SQUARE });
+  assert.equal(fromArray.edges.length, fromObject.edges.length);
+
+  // Bare-array input indices equal the ring indices (the only sites present).
+  const corners = fromArray.vertices.filter((v) => v.isInput);
+  assert.equal(corners.length, 4);
+  for (const v of corners) assert.equal(v.source.input, 0);
 });
