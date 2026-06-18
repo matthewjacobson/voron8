@@ -18,18 +18,18 @@
       <h1>voron8 — UMD build from a CDN</h1>
       <p>
         No bundler, no build step: this page loads
-        <code>voron8.umd.cjs</code> from jsDelivr via a classic
+        <code>voron8.umd.js</code> from jsDelivr via a classic
         <code>&lt;script&gt;</code> tag, which exposes a global <code>voron8</code>.
       </p>
     </header>
     <canvas id="c"></canvas>
 
     <!-- UMD build straight from the CDN. The package's `jsdelivr` field points
-         at dist/voron8.umd.js, so `voron8@3.0.0` resolves to it too; the full
-         path is spelled out here for clarity. Pin a version for reproducibility;
-         drop `@3.0.0` to always track the latest. (Use the .js build, not .cjs:
-         CDNs serve .cjs with a non-JS MIME type that blocks <script> execution.) -->
-    <script src="https://cdn.jsdelivr.net/npm/voron8@3.0.0/dist/voron8.umd.js"></script>
+         at dist/voron8.umd.js, so the version-less path below resolves to it and
+         always tracks the latest release. Add `@<version>` (e.g. voron8@3.1.0)
+         to pin for reproducibility. (Use the .js build, not .cjs: CDNs serve
+         .cjs with a non-JS MIME type that blocks <script> execution.) -->
+    <script src="https://cdn.jsdelivr.net/npm/voron8/dist/voron8.umd.js"></script>
     <script>
       // `voron8` is now a global. init() loads the inlined wasm (the only async
       // step); voronoi()/medialAxis() are synchronous afterwards.
