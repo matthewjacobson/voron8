@@ -1,4 +1,5 @@
-// voron8 — CGAL Segment Voronoi diagram of polygons, compiled to WebAssembly.
+// voron8 — CGAL Segment Voronoi diagram of points, segments, and polygons,
+// compiled to WebAssembly.
 //
 // Kernel choice (see README "Why a filtered kernel on WASM"): WebAssembly has no
 // instruction to change the FPU rounding mode — every op rounds to nearest — so
@@ -71,19 +72,26 @@ emscripten::val point_val(const Point_2& p) {
 } // namespace
 
 // coords:    flat [x0,y0,x1,y1,...] of every ring vertex, rings concatenated.
-// ringSizes: vertex count of each ring, in order.
-// Rings are treated as closed (last vertex connects back to the first).
-emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringSizesVal) {
+// ringSizes: vertex count of each ring, in order. A size-1 ring is an isolated
+//            point site; a size>=2 ring is a polyline/polygon.
+// closed:    1 if the ring is a closed polygon (last vertex connects back to the
+//            first), 0 if it is an open polyline or an isolated point.
+emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringSizesVal,
+                                emscripten::val closedVal) {
   const std::vector<double> coords =
       emscripten::convertJSArrayToNumberVector<double>(coordsVal);
   const std::vector<int> ringSizes =
       emscripten::convertJSArrayToNumberVector<int>(ringSizesVal);
+  const std::vector<int> closed =
+      emscripten::convertJSArrayToNumberVector<int>(closedVal);
 
-  // Build the point list plus a (polygon, vertex) provenance entry for each point,
-  // and the closed-ring edge index pairs that insert_segments consumes.
+  // Build the point list plus an (input, vertex) provenance entry for each point,
+  // the edge index pairs that insert_segments consumes, and the isolated points
+  // (rings of size 1) that have no incident edge and must be inserted directly.
   std::vector<Point_2> points;
-  std::vector<std::pair<int, int>> provenance;  // (polygon index, vertex index)
+  std::vector<std::pair<int, int>> provenance;  // (input index, vertex index)
   std::vector<std::pair<std::size_t, std::size_t>> indices;
+  std::vector<std::size_t> lonePoints;
 
   std::size_t cursor = 0;  // index into coords (advances by 2 per vertex)
   for (int poly = 0; poly < static_cast<int>(ringSizes.size()); ++poly) {
@@ -95,8 +103,16 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
       provenance.emplace_back(poly, v);
       cursor += 2;
     }
-    for (int v = 0; v < n; ++v) {
-      indices.emplace_back(base + v, base + (v + 1) % n);
+    if (n == 1) {
+      // Isolated point: no edges; insert_segments would never see it.
+      lonePoints.push_back(base);
+      continue;
+    }
+    for (int v = 0; v + 1 < n; ++v) {
+      indices.emplace_back(base + v, base + v + 1);
+    }
+    if (poly < static_cast<int>(closed.size()) && closed[poly]) {
+      indices.emplace_back(base + (n - 1), base + 0);  // close the ring
     }
   }
 
@@ -108,9 +124,13 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
 
   SDG sdg;
   // insert_segments spatial-sorts internally before insertion — the speedup the
-  // CGAL "fast-sp-polygon" example demonstrates.
+  // CGAL "fast-sp-polygon" example demonstrates. It inserts each segment's two
+  // endpoints as point sites too, so only truly isolated points need insert().
   if (!indices.empty()) {
     sdg.insert_segments(points, indices.begin(), indices.end());
+  }
+  for (std::size_t idx : lonePoints) {
+    sdg.insert(points[idx]);
   }
 
   // --- Voronoi vertices: one per finite face of the Delaunay graph. ---
@@ -126,7 +146,7 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     if (hit != inputIndex.end()) {
       v.set("isInput", true);
       emscripten::val src = emscripten::val::object();
-      src.set("polygon", hit->second.first);
+      src.set("input", hit->second.first);
       src.set("vertex", hit->second.second);
       v.set("source", src);
     } else {
@@ -143,13 +163,13 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
   // A Voronoi edge is the bisector of the two sites sitting across it; those are
   // the ccw/cw vertices of the Delaunay edge. We report each so callers can,
   // e.g., drop bisectors defined by a reflex vertex when extracting a medial axis.
-  // Map a point back to its input {polygon, vertex}, or null if it isn't an
-  // input corner (e.g. a segment-intersection point).
+  // Map a point back to its input {input, vertex}, or null if it isn't an input
+  // corner (e.g. a point where two segments cross, inserted by CGAL).
   auto vref = [&](const Point_2& p) -> emscripten::val {
     auto hit = inputIndex.find(p);
     if (hit == inputIndex.end()) return emscripten::val::null();
     emscripten::val r = emscripten::val::object();
-    r.set("polygon", hit->second.first);
+    r.set("input", hit->second.first);
     r.set("vertex", hit->second.second);
     return r;
   };

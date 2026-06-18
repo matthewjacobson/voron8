@@ -25,10 +25,10 @@
   const ctx = canvas.getContext("2d");
   const hud = document.getElementById("hud");
 
-  // --- The polygon a site originates from, or null if unattributable. ---
+  // --- The input a site originates from, or null if unattributable. ---
   const sitePolygon = (s) => {
-    if (s.type === "point")   return s.source ? s.source.polygon : null;
-    if (s.type === "segment") return s.segment?.[0]?.polygon ?? s.segment?.[1]?.polygon ?? null;
+    if (s.type === "point")   return s.source ? s.source.input : null;
+    if (s.type === "segment") return s.segment?.[0]?.input ?? s.segment?.[1]?.input ?? null;
     return null; // infinite
   };
   // True when an edge is the bisector between two *different* input polygons.
