@@ -24,6 +24,9 @@
 #include <CGAL/Segment_Delaunay_graph_2.h>
 #include <CGAL/Segment_Delaunay_graph_filtered_traits_2.h>
 #include <CGAL/Parabola_segment_2.h>
+#include <CGAL/Voronoi_diagram_2.h>
+#include <CGAL/Segment_Delaunay_graph_adaptation_traits_2.h>
+#include <CGAL/Segment_Delaunay_graph_adaptation_policies_2.h>
 
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
@@ -39,6 +42,15 @@ typedef double                                                      NT;
 typedef CGAL::Simple_cartesian<double>                              CK;
 typedef CGAL::Segment_Delaunay_graph_filtered_traits_2<CK>          Gt;
 typedef CGAL::Segment_Delaunay_graph_2<Gt>                          SDG;
+
+// Voronoi-diagram adaptor over the segment Delaunay graph. It presents the dual
+// directly as faces (one per site) with ordered boundary circulators, so the
+// cells need not be reassembled from the edge soup on the JS side. The
+// degeneracy-removal policy yields a clean diagram (no zero-length edges/merged
+// covertices).
+typedef CGAL::Segment_Delaunay_graph_adaptation_traits_2<SDG>            AT;
+typedef CGAL::Segment_Delaunay_graph_degeneracy_removal_policy_2<SDG>    AP;
+typedef CGAL::Voronoi_diagram_2<SDG, AT, AP>                            VD;
 
 typedef SDG::Point_2       Point_2;
 typedef SDG::Face_handle   Face_handle;
@@ -69,6 +81,17 @@ emscripten::val point_val(const Point_2& p) {
   return o;
 }
 
+// Canonical key for an undirected Delaunay edge: the unordered pair of the two
+// site vertices it separates (equivalently, the two sites of its dual Voronoi
+// edge). Both representations of the edge — (f,i) and its mirror — map here to
+// the same key, so a face's boundary halfedge can look up the emitted edge index
+// via he->dual(). Vertex handles are stable for the lifetime of one call.
+std::pair<const void*, const void*> edge_key(const SDG& sdg, const SDG::Edge& e) {
+  const void* a = &*e.first->vertex(sdg.ccw(e.second));
+  const void* b = &*e.first->vertex(sdg.cw(e.second));
+  return a < b ? std::make_pair(a, b) : std::make_pair(b, a);
+}
+
 } // namespace
 
 // coords:    flat [x0,y0,x1,y1,...] of every ring vertex, rings concatenated.
@@ -76,14 +99,19 @@ emscripten::val point_val(const Point_2& p) {
 //            point site; a size>=2 ring is a polyline/polygon.
 // closed:    1 if the ring is a closed polygon (last vertex connects back to the
 //            first), 0 if it is an open polyline or an isolated point.
+// labels:    optional group label per ring (same order). When non-empty, the
+//            result gains `faces`-style outlines of the union of each label's
+//            cells (the compound-Voronoi territories). Empty = no grouping.
 emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringSizesVal,
-                                emscripten::val closedVal) {
+                                emscripten::val closedVal, emscripten::val labelsVal) {
   const std::vector<double> coords =
       emscripten::convertJSArrayToNumberVector<double>(coordsVal);
   const std::vector<int> ringSizes =
       emscripten::convertJSArrayToNumberVector<int>(ringSizesVal);
   const std::vector<int> closed =
       emscripten::convertJSArrayToNumberVector<int>(closedVal);
+  const std::vector<int> labels =
+      emscripten::convertJSArrayToNumberVector<int>(labelsVal);
 
   // Build the point list plus an (input, vertex) provenance entry for each point,
   // the edge index pairs that insert_segments consumes, and the isolated points
@@ -122,16 +150,23 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     inputIndex.emplace(points[i], provenance[i]);
   }
 
-  SDG sdg;
+  SDG sdg_build;
   // insert_segments spatial-sorts internally before insertion — the speedup the
   // CGAL "fast-sp-polygon" example demonstrates. It inserts each segment's two
   // endpoints as point sites too, so only truly isolated points need insert().
   if (!indices.empty()) {
-    sdg.insert_segments(points, indices.begin(), indices.end());
+    sdg_build.insert_segments(points, indices.begin(), indices.end());
   }
   for (std::size_t idx : lonePoints) {
-    sdg.insert(points[idx]);
+    sdg_build.insert(points[idx]);
   }
+
+  // Wrap the graph in the Voronoi adaptor (swap = move, leaving sdg_build empty)
+  // and treat the adaptor's own dual graph as authoritative from here on. Edge
+  // and vertex handles obtained below — and from face boundary halfedges — then
+  // refer to the same graph instance, so edge_key lookups match.
+  VD vd(sdg_build, true);
+  const SDG& sdg = vd.dual();
 
   // --- Voronoi vertices: one per finite face of the Delaunay graph. ---
   std::map<Face_handle, int> faceIndex;
@@ -201,6 +236,10 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     return s;
   };
 
+  // Maps an undirected Delaunay edge to its emitted index, so a face's boundary
+  // halfedges (he->dual()) can reference edges[] instead of duplicating geometry.
+  std::map<std::pair<const void*, const void*>, int> edgeIndex;
+
   emscripten::val edges = emscripten::val::array();
   int eIdx = 0;
   for (auto eit = sdg.finite_edges_begin(); eit != sdg.finite_edges_end(); ++eit) {
@@ -262,13 +301,180 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
       continue;  // unknown primal geometry — skip defensively
     }
 
+    edgeIndex[edge_key(sdg, e)] = eIdx;  // only for edges actually emitted
     edges.set(eIdx, edge);
     ++eIdx;
+  }
+
+  // --- Voronoi faces (cells): one per site, with an ordered boundary. ---
+  // The adaptor gives each face's boundary as a CCW halfedge circulator, so we
+  // emit each cell as its site plus the ordered list of edge indices bounding
+  // it — no reassembly (edge bucketing, vertex chaining) needed downstream. For
+  // an unbounded cell the boundary is an open arc: we break the cyclic ccb at
+  // the vertex at infinity so boundary[0] and boundary[last] are its two rays.
+  emscripten::val faces = emscripten::val::array();
+  int fIdx = 0;
+  for (auto fit = vd.faces_begin(); fit != vd.faces_end(); ++fit) {
+    std::vector<VD::Halfedge_handle> hes;
+    VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
+    do { hes.push_back(ccb); } while (++ccb != done);
+
+    bool unbounded = false;
+    int startAt = 0;  // index of the halfedge emanating from infinity, if any
+    for (std::size_t i = 0; i < hes.size(); ++i) {
+      if (!hes[i]->has_source() || !hes[i]->has_target()) unbounded = true;
+      if (!hes[i]->has_source()) startAt = static_cast<int>(i);
+    }
+
+    emscripten::val boundary = emscripten::val::array();
+    int bIdx = 0;
+    for (std::size_t k = 0; k < hes.size(); ++k) {
+      VD::Halfedge_handle he = hes[(startAt + k) % hes.size()];
+      auto hit = edgeIndex.find(edge_key(sdg, he->dual()));
+      if (hit == edgeIndex.end()) continue;  // edge was skipped above — defensive
+      boundary.set(bIdx++, hit->second);
+    }
+
+    emscripten::val face = emscripten::val::object();
+    face.set("site", describe_site(fit->dual()));  // the cell's generating site
+    face.set("unbounded", unbounded);
+    face.set("boundary", boundary);
+    faces.set(fIdx++, face);
+  }
+
+  // --- Compound-Voronoi groups: the outline of the union of each label's cells.
+  // The union of a set of cells is a face of the *quotient* diagram, so its
+  // boundary is reported exactly like a cell's: ordered edge indices (CCW), with
+  // unbounded outlines opened at infinity. Only emitted when labels are given.
+  emscripten::val groups = emscripten::val::array();
+  if (!labels.empty()) {
+    // Ring (input) index a site came from, or -1 for a synthesized crossing
+    // point that has no input provenance.
+    auto site_input = [&](Vertex_handle v) -> int {
+      const Site_2 s = v->site();
+      auto look = [&](const Point_2& p) -> int {
+        auto h = inputIndex.find(p);
+        return h == inputIndex.end() ? -1 : h->second.first;
+      };
+      if (s.is_point()) return look(s.point());
+      const int i = look(s.source());
+      return i >= 0 ? i : look(s.target());
+    };
+
+    // Dense internal group id per distinct caller label, so caller labels never
+    // collide with the unique ids handed to unresolved crossing cells below.
+    std::map<int, int> labelToId;
+    std::vector<int> idToLabel;
+    auto internOf = [&](int lbl) -> int {
+      auto it = labelToId.find(lbl);
+      if (it != labelToId.end()) return it->second;
+      const int id = static_cast<int>(idToLabel.size());
+      labelToId.emplace(lbl, id);
+      idToLabel.push_back(lbl);
+      return id;
+    };
+
+    // Label every cell. A VD face is identified by its site vertex (face->dual()
+    // is stable), so we key by that. Cells whose site has an input take that
+    // input's label; crossing-point cells start unlabeled (id -1).
+    std::map<const void*, int> groupId;
+    std::map<const void*, std::vector<const void*>> nbrs;  // unlabeled adjacency
+    std::vector<const void*> unlabeled;
+    for (auto fit = vd.faces_begin(); fit != vd.faces_end(); ++fit) {
+      const int in = site_input(fit->dual());
+      groupId[&*fit->dual()] = in >= 0 ? internOf(labels[in]) : -1;
+    }
+    for (auto fit = vd.faces_begin(); fit != vd.faces_end(); ++fit) {
+      const void* key = &*fit->dual();
+      if (groupId[key] != -1) continue;
+      unlabeled.push_back(key);
+      VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
+      do { nbrs[key].push_back(&*ccb->opposite()->face()->dual()); } while (++ccb != done);
+    }
+    // Policy (b): an unlabeled (crossing) cell adopts label L when all of its
+    // *labeled* neighbours agree on L; a cell straddling two labels stays
+    // unlabeled (a genuine junction). Iterate to convergence so chains of
+    // adjacent crossing cells resolve inward from their labeled borders.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const void* f : unlabeled) {
+        if (groupId[f] != -1) continue;
+        int found = -1; bool conflict = false;
+        for (const void* nb : nbrs[f]) {
+          const int li = groupId[nb];
+          if (li < 0) continue;
+          if (found < 0) found = li; else if (found != li) conflict = true;
+        }
+        if (!conflict && found >= 0) { groupId[f] = found; changed = true; }
+      }
+    }
+    // Any cell still unlabeled (a real multi-label junction) becomes its own
+    // singleton group — a fresh id mapped to no caller label, so it is excluded
+    // from every reported union (it shows as a sliver hole, which is correct).
+    int nextId = static_cast<int>(idToLabel.size());
+    for (const void* f : unlabeled) if (groupId[f] == -1) groupId[f] = nextId++;
+
+    auto labelOf = [&](VD::Halfedge_handle h) { return groupId[&*h->face()->dual()]; };
+
+    // Trace each caller group's outline. A directed halfedge is on group gid's
+    // outline iff its cell is in gid and its twin's cell is not; advance by
+    // turning into adjacent same-group cells. A group may yield several rings.
+    for (int gid = 0; gid < static_cast<int>(idToLabel.size()); ++gid) {
+      emscripten::val rings = emscripten::val::array();
+      int rIdx = 0;
+      std::set<int> usedEdge;  // frontier edges already placed in a ring of gid
+      for (auto h = vd.halfedges_begin(); h != vd.halfedges_end(); ++h) {
+        VD::Halfedge_handle start = h;
+        if (labelOf(start) != gid || labelOf(start->opposite()) == gid) continue;
+        auto sk = edgeIndex.find(edge_key(sdg, start->dual()));
+        if (sk != edgeIndex.end() && usedEdge.count(sk->second)) continue;
+
+        std::vector<VD::Halfedge_handle> hs;
+        VD::Halfedge_handle e = start;
+        int guard = 0;
+        do {
+          hs.push_back(e);
+          VD::Halfedge_handle n = e->next();
+          while (labelOf(n->opposite()) == gid) n = n->opposite()->next();
+          e = n;
+        } while (e != start && ++guard < 1000000);
+
+        // Open an unbounded outline at infinity, like a cell boundary, so its
+        // two rays end up first and last.
+        bool unbounded = false;
+        int startAt = 0;
+        for (std::size_t i = 0; i < hs.size(); ++i) {
+          if (!hs[i]->has_source() || !hs[i]->has_target()) unbounded = true;
+          if (!hs[i]->has_source()) startAt = static_cast<int>(i);
+        }
+        emscripten::val boundary = emscripten::val::array();
+        int bi = 0;
+        for (std::size_t k = 0; k < hs.size(); ++k) {
+          VD::Halfedge_handle he = hs[(startAt + k) % hs.size()];
+          auto it = edgeIndex.find(edge_key(sdg, he->dual()));
+          if (it == edgeIndex.end()) continue;
+          usedEdge.insert(it->second);
+          boundary.set(bi++, it->second);
+        }
+
+        emscripten::val r = emscripten::val::object();
+        r.set("unbounded", unbounded);
+        r.set("boundary", boundary);
+        rings.set(rIdx++, r);
+      }
+      emscripten::val g = emscripten::val::object();
+      g.set("label", idToLabel[gid]);
+      g.set("rings", rings);
+      groups.set(gid, g);
+    }
   }
 
   emscripten::val result = emscripten::val::object();
   result.set("vertices", vertices);
   result.set("edges", edges);
+  result.set("faces", faces);
+  result.set("groups", groups);
   return result;
 }
 

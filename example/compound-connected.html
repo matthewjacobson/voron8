@@ -132,35 +132,18 @@
   const hueOf = (root) => Math.floor((root * 137.508) % 360);
 
   // ===========================================================================
-  // extractFaces(): build the Voronoi *faces* (cells) from the edge soup.
+  // extractGroups(): turn voron8's compound-Voronoi *group outlines* into
+  // fillable canvas polygons — one merged territory per compound shape.
   //
-  // voron8 returns an edge list, not faces — but every edge carries the two
-  // `sites` it bisects, so a face is simply "all edges that share one site,"
-  // chained head-to-tail into a closed boundary. Most cells here are unbounded
-  // (the strokes are open), so a cell's boundary is an open chain whose two ends
-  // fly off to infinity; we close it against a frame that encloses the canvas,
-  // pick the closure that actually contains the site, then clip to the canvas.
-  //
-  // Each returned face is tagged with its connected component, so the caller can
-  // fill all cells of a compound shape with one hue: same-component cells abut
-  // and share a color, so their interior walls vanish and only the inter-shape
-  // separators (the green network) remain visible as boundaries.
+  // We call voronoi() with `labels` (each stroke's connected component), so the
+  // result carries `groups`: per label, the outline of the union of that label's
+  // cells, already given as edge indices in CCW order (the same shape as a face
+  // boundary). So a compound shape is a *single* polygon, not a pile of cells —
+  // no per-cell fill, no internal seams. We only tessellate each boundary edge
+  // in order, close any unbounded outline against a frame enclosing the canvas,
+  // and clip to the canvas. CGAL even folds each crossing point (interior to its
+  // merged shape) into the territory, so the outline has no sliver holes.
   // ===========================================================================
-
-  // A site's cell identity. Mirrors siteComponent(): crossing points (null
-  // provenance) and the infinite site own no cell. A segment site is keyed by
-  // its *unordered* endpoint pair — CGAL may list the two endpoints in either
-  // order across an edge's site refs, and keying on a single endpoint would
-  // split one cell's edges into two broken buckets.
-  const refKey = (r) => (r ? `${r.input}.${r.vertex}` : "x");
-  const siteKey = (s) => {
-    if (s.type === "segment") {
-      const a = refKey(s.segment?.[0]), b = refKey(s.segment?.[1]);
-      return a === "x" && b === "x" ? null : `s:${[a, b].sort().join("|")}`;
-    }
-    if (s.type === "point") return s.source ? `p:${refKey(s.source)}` : null;
-    return null;
-  };
 
   // Distance from (x,y) to a segment.
   const distSeg = (x, y, ax, ay, bx, by) => {
@@ -168,81 +151,40 @@
     const t = l2 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / l2)) : 0;
     return Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
   };
-  // Distance from (x,y) to a *site*'s geometry, or null when the site can't be
-  // measured (a segment with one endpoint at an unattributable crossing).
-  const siteDist = (s, x, y, world) => {
-    if (s.type === "segment") {
-      const a = s.segment?.[0], b = s.segment?.[1];
-      if (!a || !b) return null;
-      const pa = world[a.input][a.vertex], pb = world[b.input][b.vertex];
-      return distSeg(x, y, pa[0], pa[1], pb[0], pb[1]);
+  // Component of the stroke nearest to (x,y). Used to decide which frame corners
+  // belong to a territory when closing its unbounded outline (a far corner is in
+  // the territory iff its nearest stroke is in that component).
+  const nearestComponent = (x, y, world, comp) => {
+    let best = Infinity, c = null;
+    for (let k = 0; k < world.length; k++) {
+      const pts = world[k];
+      for (let i = 0; i + 1 < pts.length; i++) {
+        const d = distSeg(x, y, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]);
+        if (d < best) { best = d; c = comp[k]; }
+      }
     }
-    if (s.type === "point" && s.source) {
-      const p = world[s.source.input][s.source.vertex];
-      return Math.hypot(x - p[0], y - p[1]);
-    }
-    return null;
-  };
-  // Distance from (x,y) to the nearest input feature across all strokes. Since
-  // every site is a sub-feature of some stroke, a point lies in site S's cell
-  // exactly when siteDist(S) equals this minimum.
-  const nearestFeatureDist = (x, y, world) => {
-    let m = Infinity;
-    for (const pts of world)
-      for (let i = 0; i + 1 < pts.length; i++)
-        m = Math.min(m, distSeg(x, y, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]));
-    return m;
+    return c;
   };
 
-  // Tessellate one edge, oriented so its first point sits at vertex `startV`
-  // (or, when startV is -1, at its infinite end — the point farthest from its
-  // one finite vertex). Lets us walk a cell's edges into a continuous polyline.
-  const orientedPts = (e, vertices, startV, big) => {
+  // Tessellate one boundary edge, oriented so its polyline begins at Voronoi
+  // vertex index `startV` (or, when startV is -1, at the edge's infinite end —
+  // the point farthest from its one finite vertex). The boundary order is given
+  // by CGAL; this only fixes each edge's direction so successive edges connect.
+  const orientStart = (e, vertices, startV, big) => {
     const pts = tessellate(e.geometry, { parabolaSamples: 14, infiniteLength: big });
-    const last = pts[pts.length - 1];
-    const c = vertices[startV >= 0 ? startV : (e.from >= 0 ? e.from : e.to)];
-    const d0 = (pts[0].x - c.x) ** 2 + (pts[0].y - c.y) ** 2;
-    const dN = (last.x - c.x) ** 2 + (last.y - c.y) ** 2;
-    // startV>=0: begin at that vertex (nearest end first).
-    // startV<0:  begin at infinity (farthest-from-finite-vertex end first).
-    const beginAtNear = startV >= 0;
-    return (beginAtNear ? d0 <= dN : d0 >= dN) ? pts : pts.slice().reverse();
+    const anchor = vertices[startV >= 0 ? startV : (e.from >= 0 ? e.from : e.to)];
+    const a = pts[0], b = pts[pts.length - 1];
+    const d0 = (a.x - anchor.x) ** 2 + (a.y - anchor.y) ** 2;
+    const dN = (b.x - anchor.x) ** 2 + (b.y - anchor.y) ** 2;
+    return (startV >= 0 ? d0 <= dN : d0 >= dN) ? pts : pts.slice().reverse();
   };
-
-  // Chain a cell's edges into one boundary polyline. Returns { pts, bounded }.
-  // Bounded cells form a closed loop; unbounded cells form an open chain whose
-  // first and last points are out near infinity. Returns null for the rare
-  // doubly-infinite ("line") case, which we don't fill.
-  function chainCell(edges, vertices, big) {
-    if (edges.some((e) => e.geometry.type === "line")) return null;
-    const bounded = edges.every((e) => e.from >= 0 && e.to >= 0);
-    const at = new Map();                              // finite vertex -> [edge index]
-    edges.forEach((e, i) => {
-      for (const v of [e.from, e.to]) if (v >= 0) (at.get(v) ?? at.set(v, []).get(v)).push(i);
-    });
-    const used = new Array(edges.length).fill(false);
-    const pts = [];
-
-    // Start at a terminal (infinite-ended) edge if unbounded, else any edge.
-    let cur = bounded ? 0 : edges.findIndex((e) => e.from < 0 || e.to < 0);
-    if (cur < 0) return null;
-    used[cur] = true;
-    const startV = bounded ? edges[cur].from : -1;
-    pts.push(...orientedPts(edges[cur], vertices, startV, big));
-    let tip = bounded
-      ? edges[cur].to
-      : (edges[cur].from >= 0 ? edges[cur].from : edges[cur].to);
-
-    while (tip >= 0 && tip !== startV) {
-      const next = (at.get(tip) ?? []).find((i) => !used[i]);
-      if (next === undefined) break;                   // open/degenerate chain
-      used[next] = true;
-      const e = edges[next];
-      pts.push(...orientedPts(e, vertices, tip, big).slice(1)); // drop duplicate tip
-      tip = (e.from < 0 || e.to < 0) ? -1 : (e.from === tip ? e.to : e.from);
-    }
-    return { pts, bounded };
-  }
+  // The other endpoint (vertex index) of edge e, given one of its endpoints.
+  const otherEnd = (e, v) => (e.from === v ? e.to : e.from);
+  // The Voronoi vertex two consecutive boundary edges share.
+  const sharedVertex = (a, b) => {
+    const sa = new Set([a.from, a.to].filter((v) => v >= 0));
+    return [b.from, b.to].find((v) => v >= 0 && sa.has(v));
+  };
 
   // --- Small geometry helpers for closing & clipping. ---
   // Liang–Barsky: where the segment from inside-point `pin` leaves rectangle S.
@@ -282,28 +224,20 @@
       .map((o) => o.c);
   };
 
-  // Close an unbounded cell's open chain against frame S. The cell's boundary
-  // along ∂S is the single arc, between the two exit points, whose corners lie
-  // in the cell — decided by the exact nearest-site test, so we never rely on
-  // an even-odd test of a possibly self-touching polygon. Returns null when the
-  // site can't be measured (segment with an unattributable crossing endpoint).
-  function closeUnbounded(pts, S, site, world) {
-    if (pts.length < 2 || siteDist(site, 0, 0, world) === null) return null;
+  // Close an unbounded outline's open chain against frame S. The region's
+  // boundary along ∂S is the single arc, between the two exit points, whose
+  // corners lie in the region — decided by the exact `inRegion(x,y)` test, so we
+  // never rely on an even-odd test of a possibly self-touching polygon.
+  function closeUnbounded(pts, S, inRegion) {
+    if (pts.length < 2) return null;
     const exitA = exitOf(pts[1], pts[0], S);
     const exitB = exitOf(pts[pts.length - 2], pts[pts.length - 1], S);
     const base = [exitA, ...pts.slice(1, -1), exitB];
     const tA = perimT(exitA, S), tB = perimT(exitB, S);
     const corners = framesCorners(S);
 
-    // Corner ids that belong to this cell (this site is their nearest feature).
-    const want = new Set(
-      corners
-        .filter((c) => {
-          const eps = 1e-6 * (1 + nearestFeatureDist(c.x, c.y, world));
-          return siteDist(site, c.x, c.y, world) <= nearestFeatureDist(c.x, c.y, world) + eps;
-        })
-        .map((c) => c.id),
-    );
+    // Corner ids that belong to this region.
+    const want = new Set(corners.filter((c) => inRegion(c.x, c.y)).map((c) => c.id));
     // Connector walks exitB → exitA; pick the arc whose corner set is `want`.
     const inc = cornersBetween(tB, tA, corners);                 // +t direction
     const dec = cornersBetween(tA, tB, corners).reverse();       // −t direction
@@ -336,12 +270,16 @@
     return p;
   }
 
-  // One face per site cell, clipped to the canvas and tagged with its component.
-  function extractFaces(result, comp, world) {
-    const { vertices, edges } = result;
+  // Build one polygon per compound shape from voron8's group outlines. Each
+  // group is the union of a component's cells; `rings` are its outline loops
+  // (usually one, more if the territory has holes or disconnected pieces).
+  // Returns [{ label, path }] where path is a single fillable/strokable Path2D.
+  function extractGroups(result, comp, world) {
+    const { vertices, edges, groups } = result;
+    if (!groups) return [];
 
     // Frame enclosing every finite Voronoi vertex and the whole canvas, padded
-    // so unbounded cells have room to close outside the drawable region.
+    // so unbounded outlines have room to close outside the drawable region.
     let minX = 0, minY = 0, maxX = W, maxY = H;
     for (const v of vertices) {
       if (!Number.isFinite(v.x) || !Number.isFinite(v.y)) continue;
@@ -353,44 +291,61 @@
     const big = (S.maxX - S.minX + S.maxY - S.minY) * 8 + 1e4;
     const box = { minX: 0, minY: 0, maxX: W, maxY: H };
 
-    // Bucket edges by the two sites each one bisects.
-    const cells = new Map();
-    for (const e of edges) for (const s of e.sites) {
-      const k = siteKey(s);
-      if (k === null) continue;
-      (cells.get(k) ?? cells.set(k, { site: s, edges: [] }).get(k)).edges.push(e);
-    }
+    const out = [];
+    for (const group of groups) {
+      const inRegion = (x, y) => nearestComponent(x, y, world, comp) === group.label;
+      const path = new Path2D();
+      let drew = false;
+      for (const ring of group.rings) {
+        const b = ring.boundary.map((i) => edges[i]);
+        if (b.length < 2) continue;
 
-    const faces = [];
-    for (const { site, edges: cellEdges } of cells.values()) {
-      const component = siteComponent(site, comp);
-      if (component === null) continue;
-      const chained = chainCell(cellEdges, vertices, big);
-      if (!chained || chained.pts.length < 3) continue;
-
-      let ring = chained.pts;
-      if (!chained.bounded) {
-        ring = closeUnbounded(chained.pts, S, site, world);
-        if (!ring) continue;                            // unattributable → skip
+        // Stitch the outline edges (CCW-ordered by CGAL) into a polyline, fixing
+        // each edge's direction so successive edges meet end-to-end.
+        let poly = [], tip;
+        if (ring.unbounded) {
+          // Open arc: boundary[0] and the last edge are the outline's two rays.
+          poly.push(...orientStart(b[0], vertices, -1, big));    // start at infinity
+          tip = b[0].from >= 0 ? b[0].from : b[0].to;
+          for (let k = 1; k < b.length; k++) {
+            poly.push(...orientStart(b[k], vertices, tip, big).slice(1));
+            tip = otherEnd(b[k], tip);                           // -1 on the final ray
+          }
+          poly = closeUnbounded(poly, S, inRegion);
+          if (!poly) continue;
+        } else {
+          // Closed loop: seed direction from the vertex edge[0] shares with edge[1].
+          const sh = sharedVertex(b[0], b[1]);
+          poly.push(...orientStart(b[0], vertices, otherEnd(b[0], sh), big));
+          tip = sh;
+          for (let k = 1; k < b.length; k++) {
+            poly.push(...orientStart(b[k], vertices, tip, big).slice(1));
+            tip = otherEnd(b[k], tip);
+          }
+        }
+        const clipped = clipToBox(poly, box);
+        if (clipped.length < 3) continue;
+        path.moveTo(clipped[0].x, clipped[0].y);
+        for (let i = 1; i < clipped.length; i++) path.lineTo(clipped[i].x, clipped[i].y);
+        path.closePath();
+        drew = true;
       }
-      const clipped = clipToBox(ring, box);
-      if (clipped.length >= 3) faces.push({ component, ring: clipped });
+      if (drew) out.push({ label: group.label, path });
     }
-    return faces;
+    return out;
   }
 
-  function draw(world, comp, sep, faces) {
+  function draw(world, comp, sep, territories) {
     ctx.clearRect(0, 0, W, H);
-    // Compound-shape territories: every cell of a component shares its hue, so
-    // their interior walls disappear and only the green separators remain.
-    for (const f of faces) {
-      if (f.ring.length < 3) continue;
-      ctx.beginPath();
-      ctx.moveTo(f.ring[0].x, f.ring[0].y);
-      for (let i = 1; i < f.ring.length; i++) ctx.lineTo(f.ring[i].x, f.ring[i].y);
-      ctx.closePath();
-      ctx.fillStyle = `hsla(${hueOf(f.component)}, 70%, 55%, 0.12)`;
-      ctx.fill();
+    // Compound-shape territories: one filled-and-stroked outline per shape. The
+    // fill is the union of the shape's Voronoi cells (a single polygon, so no
+    // internal cell seams); the green separator network traces the shared walls.
+    for (const { label, path } of territories) {
+      const hue = hueOf(label);
+      ctx.fillStyle = `hsla(${hue}, 70%, 55%, 0.16)`;
+      ctx.fill(path, "evenodd");
+      ctx.strokeStyle = `hsla(${hue}, 80%, 70%, 0.5)`; ctx.lineWidth = 1;
+      ctx.stroke(path);
     }
     // Strokes, colored by the component (compound shape) they belong to.
     for (let k = 0; k < world.length; k++) {
@@ -432,22 +387,24 @@
     const { comp, count } = buildComponents(world);
 
     const t0 = performance.now();
-    const result = voronoi({ segments: world });
+    // Label each stroke with its component; voron8 returns `groups` — the outline
+    // of the union of each component's cells (the compound-shape territories).
+    const result = voronoi({ segments: world }, { labels: comp });
     const { edges } = result;
     // Keep only bisectors between two different connected components.
     const sep = edges.filter((e) => {
       const a = siteComponent(e.sites[0], comp), b = siteComponent(e.sites[1], comp);
       return a !== null && b !== null && a !== b;
     });
-    // Assemble the Voronoi faces (cells) and tag each with its compound shape.
-    const faces = extractFaces(result, comp, world);
+    // One filled+stroked outline polygon per compound shape.
+    const territories = extractGroups(result, comp, world);
     emaMs = emaMs ? emaMs * 0.9 + (performance.now() - t0) * 0.1 : (performance.now() - t0);
 
-    draw(world, comp, sep, faces);
+    draw(world, comp, sep, territories);
     hud.textContent =
       `${N} crossing strokes → ${count} compound shape${count === 1 ? "" : "s"}\n` +
-      `voronoi()+faces: ${emaMs.toFixed(1)} ms  (~${(1000 / Math.max(emaMs, 1)).toFixed(0)} fps cap)\n` +
-      `faces: ${faces.length}  ·  separating edges: ${sep.length} / ${edges.length}`;
+      `voronoi()+groups: ${emaMs.toFixed(1)} ms  (~${(1000 / Math.max(emaMs, 1)).toFixed(0)} fps cap)\n` +
+      `territories: ${territories.length}  ·  separating edges: ${sep.length} / ${edges.length}`;
 
     requestAnimationFrame(frame);
   }

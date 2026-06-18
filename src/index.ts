@@ -119,15 +119,79 @@ export interface VoronoiEdge {
   geometry: EdgeGeometry;
 }
 
+/**
+ * A Voronoi face — the cell of one input site, as reported directly by CGAL's
+ * Voronoi-diagram adaptor (no client-side reassembly needed).
+ */
+export interface VoronoiFace {
+  /** The site this cell belongs to (its generator). */
+  site: SiteRef;
+  /** True when the cell is unbounded (its boundary runs off to infinity). */
+  unbounded: boolean;
+  /**
+   * Indices into `edges`, the cell's boundary in counter-clockwise order. For a
+   * bounded cell this is a closed loop (consecutive edges, and the last with the
+   * first, share a `vertices` endpoint). For an unbounded cell it is an open
+   * arc: `boundary[0]` and the last entry are the cell's two semi-infinite edges
+   * (rays/lines), with the gap between them lying at infinity.
+   */
+  boundary: number[];
+}
+
+/** One ring of a group's outline — same shape as a face boundary. */
+export interface OutlineRing {
+  /** True when the ring runs off to infinity (open arc; first/last are rays). */
+  unbounded: boolean;
+  /** Indices into `edges`, CCW (see `VoronoiFace.boundary`). */
+  boundary: number[];
+}
+
+/**
+ * The outline of the union of every cell sharing one label — the
+ * compound-Voronoi "territory" of that label. A union may have more than one
+ * ring (disconnected pieces, or holes).
+ */
+export interface CellGroup {
+  /** The caller-supplied label value (from the `labels` option). */
+  label: number;
+  rings: OutlineRing[];
+}
+
 export interface VoronoiResult {
   vertices: VoronoiVertex[];
   edges: VoronoiEdge[];
+  /**
+   * One face per input site. Empty for `medialAxis()`, whose `edges` are a
+   * filtered subset that the boundary indices would no longer match.
+   */
+  faces: VoronoiFace[];
+  /**
+   * One entry per distinct label, present only when `voronoi()` is called with
+   * the `labels` option. Each is the outline of the union of that label's cells.
+   */
+  groups?: CellGroup[];
+}
+
+/** Options for `voronoi()`. */
+export interface VoronoiOptions {
+  /**
+   * A group label per input, in the same flattened order as `source.input`
+   * (points, then segments, then polygons). When given, the result includes
+   * `groups`: the outline of the union of each label's cells. A synthesized
+   * crossing point (no input) inherits the label of its surrounding cells when
+   * they agree, so a label whose inputs cross merges into one territory.
+   */
+  labels?: number[];
 }
 
 type WasmModule = {
-  computeVoronoi: (coords: number[], ringSizes: number[], closed: number[]) => {
+  computeVoronoi: (
+    coords: number[], ringSizes: number[], closed: number[], labels: number[],
+  ) => {
     vertices: VoronoiVertex[];
     edges: Array<{ sites: [SiteRef, SiteRef] } & Record<string, any>>;
+    faces: Array<{ site: SiteRef; unbounded: boolean; boundary: number[] }>;
+    groups: Array<{ label: number; rings: Array<{ unbounded: boolean; boundary: number[] }> }>;
   };
 };
 
@@ -256,8 +320,10 @@ function normalizeInput(
  *              vertex is `{x,y}` or `[x,y]`. Nested polygons act as holes under
  *              the even-odd fill rule used for interior/exterior labels; points
  *              and open segments define no interior.
+ * @param options Optional. Pass `labels` (one per input) to also receive
+ *              `groups`: the outline of the union of each label's cells.
  */
-export function voronoi(input: Polygon[] | SiteInput): VoronoiResult {
+export function voronoi(input: Polygon[] | SiteInput, options: VoronoiOptions = {}): VoronoiResult {
   const mod = getModule();
 
   const { sites, fillRings } = normalizeInput(input);
@@ -272,7 +338,14 @@ export function voronoi(input: Polygon[] | SiteInput): VoronoiResult {
     closed.push(isClosed ? 1 : 0);
   }
 
-  const raw = mod.computeVoronoi(coords, ringSizes, closed);
+  const labels = options.labels ?? [];
+  if (labels.length && labels.length !== sites.length) {
+    throw new Error(
+      `voron8: labels must have one entry per input (got ${labels.length}, expected ${sites.length}).`,
+    );
+  }
+
+  const raw = mod.computeVoronoi(coords, ringSizes, closed, labels);
 
   const edges: VoronoiEdge[] = raw.edges.map((e: any) => {
     let geometry: EdgeGeometry;
@@ -308,7 +381,20 @@ export function voronoi(input: Polygon[] | SiteInput): VoronoiResult {
     return { from: e.from, to: e.to, location, sites: e.sites, geometry };
   });
 
-  return { vertices: raw.vertices, edges };
+  const faces: VoronoiFace[] = raw.faces.map((f) => ({
+    site: f.site,
+    unbounded: f.unbounded,
+    boundary: Array.from(f.boundary),
+  }));
+
+  if (!labels.length) return { vertices: raw.vertices, edges, faces };
+
+  const groups: CellGroup[] = raw.groups.map((g) => ({
+    label: g.label,
+    rings: g.rings.map((r) => ({ unbounded: r.unbounded, boundary: Array.from(r.boundary) })),
+  }));
+
+  return { vertices: raw.vertices, edges, faces, groups };
 }
 
 /**
@@ -338,7 +424,9 @@ export function medialAxis(input: Polygon[] | SiteInput): VoronoiResult {
   const edges = result.edges.filter(
     (e) => e.location === "interior" && !isIncidentBisector(e),
   );
-  return { vertices: result.vertices, edges };
+  // Faces index the full edge list; after filtering they would be stale, so the
+  // medial-axis view carries no faces (it is a skeleton, not a cell complex).
+  return { vertices: result.vertices, edges, faces: [] };
 }
 
 export interface TessellateOptions {

@@ -97,7 +97,7 @@ interface SiteInput {
   polygons?: Polygon[];                        // closed rings
 }
 
-voronoi(input: Polygon[] | SiteInput): VoronoiResult; // await init() once first
+voronoi(input: Polygon[] | SiteInput, options?: VoronoiOptions): VoronoiResult; // await init() once first
 ```
 
 You can pass any mix of site kinds:
@@ -122,6 +122,8 @@ voronoi({
 interface VoronoiResult {
   vertices: VoronoiVertex[];
   edges: VoronoiEdge[];
+  faces: VoronoiFace[];  // one per input site (empty from medialAxis())
+  groups?: CellGroup[];  // present only when the `labels` option is passed
 }
 
 interface VoronoiVertex {
@@ -146,7 +148,35 @@ interface SiteRef {
 }
 
 interface VertexRef { input: number; vertex: number; }
+
+interface VoronoiFace {
+  site: SiteRef;       // the cell's generating site
+  unbounded: boolean;  // does the cell run off to infinity?
+  boundary: number[];  // indices into edges[], the cell boundary in CCW order
+}
+
+interface VoronoiOptions { labels?: number[]; }  // one label per input
+
+interface CellGroup {
+  label: number;          // the caller-supplied label value
+  rings: OutlineRing[];   // outline of the union of this label's cells
+}
+
+interface OutlineRing { unbounded: boolean; boundary: number[]; }  // like a face boundary
 ```
+
+Each face is a Voronoi cell, reported directly by CGAL — no need to reassemble cells from the edge list. `boundary` lists the cell's edges (as indices into `edges`) in counter-clockwise order: for a bounded cell the edges form a closed loop (consecutive edges, and the last with the first, share a `vertices` endpoint); for an unbounded cell the boundary is an open arc whose first and last entries are the cell's two semi-infinite edges, with the gap between them at infinity. To render a filled cell you still clip the unbounded ones to a viewport (`tessellate` extrudes rays to a finite length); see `example/compound-connected.html`.
+
+### Compound-Voronoi groups
+
+Pass `labels` (one per input, in `source.input` order) and the result gains `groups`: for each distinct label, the **outline of the union of that label's cells** — the compound-Voronoi "territory" of that label. Each ring is shaped exactly like a face `boundary` (CCW edge indices, open at infinity when unbounded), so you render it the same way. This is computed in CGAL by tracing the frontier between differently-labeled cells, so you get one merged polygon per label rather than a pile of per-cell boundaries.
+
+```js
+// strokes that touch share a label; their cells merge into one territory
+const { groups } = voronoi({ segments: strokes }, { labels: component });
+```
+
+A synthesized segment-crossing point (which has no input) inherits the label of its surrounding cells when they agree — so when two inputs sharing a label cross, the crossing is folded into the territory rather than punching a hole in it. A genuine junction between two different labels stays its own tiny region. See `example/compound-connected.html`, which fills and strokes one outline per compound shape.
 
 `EdgeGeometry` is a tagged union — the segment Voronoi diagram has both straight and curved bisectors:
 

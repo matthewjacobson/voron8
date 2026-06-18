@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-06-18
+
+### Added
+
+- `VoronoiResult.faces` — one Voronoi **face** (cell) per input site, reported
+  directly by CGAL's Voronoi-diagram adaptor. Each face carries its `site`, an
+  `unbounded` flag, and `boundary`: the cell's edges as indices into `edges[]`
+  in CCW order (an open arc, rays first/last, when unbounded). Callers no longer
+  need to reassemble cells from the edge list.
+- `voronoi()` now takes an optional `{ labels }` (one group label per input). When
+  given, the result gains `groups` — for each distinct label, the **outline of the
+  union of that label's cells** (the compound-Voronoi territory), as `CellGroup`s
+  of `OutlineRing`s shaped like face boundaries. Traced in CGAL via the frontier
+  between differently-labeled cells. A synthesized segment-crossing point inherits
+  its surrounding label when neighbors agree, so crossings within a label merge
+  into the territory instead of punching holes. New exported types: `VoronoiFace`,
+  `VoronoiOptions`, `CellGroup`, `OutlineRing`.
+
+### Changed
+
+- `example/compound-connected.html` now fills and strokes a single union outline
+  per compound shape using the new `groups`, instead of drawing each cell.
+
 ## [3.0.0] - 2026-06-18
 
 ### Changed
@@ -94,6 +117,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   WebAssembly, with interior/exterior edge labeling, input-vertex provenance,
   `medialAxis()`, and `tessellate()`.
 
+[3.1.0]: https://github.com/matthewjacobson/voron8/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/matthewjacobson/voron8/compare/v2.0.3...v3.0.0
 [2.0.3]: https://github.com/matthewjacobson/voron8/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/matthewjacobson/voron8/compare/v2.0.1...v2.0.2
