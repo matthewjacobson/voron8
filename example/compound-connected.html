@@ -131,8 +131,267 @@
   // A stable, well-spread hue per component (golden-angle hashing of the root).
   const hueOf = (root) => Math.floor((root * 137.508) % 360);
 
-  function draw(world, comp, sep) {
+  // ===========================================================================
+  // extractFaces(): build the Voronoi *faces* (cells) from the edge soup.
+  //
+  // voron8 returns an edge list, not faces — but every edge carries the two
+  // `sites` it bisects, so a face is simply "all edges that share one site,"
+  // chained head-to-tail into a closed boundary. Most cells here are unbounded
+  // (the strokes are open), so a cell's boundary is an open chain whose two ends
+  // fly off to infinity; we close it against a frame that encloses the canvas,
+  // pick the closure that actually contains the site, then clip to the canvas.
+  //
+  // Each returned face is tagged with its connected component, so the caller can
+  // fill all cells of a compound shape with one hue: same-component cells abut
+  // and share a color, so their interior walls vanish and only the inter-shape
+  // separators (the green network) remain visible as boundaries.
+  // ===========================================================================
+
+  // A site's cell identity. Mirrors siteComponent(): crossing points (null
+  // provenance) and the infinite site own no cell. A segment site is keyed by
+  // its *unordered* endpoint pair — CGAL may list the two endpoints in either
+  // order across an edge's site refs, and keying on a single endpoint would
+  // split one cell's edges into two broken buckets.
+  const refKey = (r) => (r ? `${r.input}.${r.vertex}` : "x");
+  const siteKey = (s) => {
+    if (s.type === "segment") {
+      const a = refKey(s.segment?.[0]), b = refKey(s.segment?.[1]);
+      return a === "x" && b === "x" ? null : `s:${[a, b].sort().join("|")}`;
+    }
+    if (s.type === "point") return s.source ? `p:${refKey(s.source)}` : null;
+    return null;
+  };
+
+  // Distance from (x,y) to a segment.
+  const distSeg = (x, y, ax, ay, bx, by) => {
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    const t = l2 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / l2)) : 0;
+    return Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
+  };
+  // Distance from (x,y) to a *site*'s geometry, or null when the site can't be
+  // measured (a segment with one endpoint at an unattributable crossing).
+  const siteDist = (s, x, y, world) => {
+    if (s.type === "segment") {
+      const a = s.segment?.[0], b = s.segment?.[1];
+      if (!a || !b) return null;
+      const pa = world[a.input][a.vertex], pb = world[b.input][b.vertex];
+      return distSeg(x, y, pa[0], pa[1], pb[0], pb[1]);
+    }
+    if (s.type === "point" && s.source) {
+      const p = world[s.source.input][s.source.vertex];
+      return Math.hypot(x - p[0], y - p[1]);
+    }
+    return null;
+  };
+  // Distance from (x,y) to the nearest input feature across all strokes. Since
+  // every site is a sub-feature of some stroke, a point lies in site S's cell
+  // exactly when siteDist(S) equals this minimum.
+  const nearestFeatureDist = (x, y, world) => {
+    let m = Infinity;
+    for (const pts of world)
+      for (let i = 0; i + 1 < pts.length; i++)
+        m = Math.min(m, distSeg(x, y, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]));
+    return m;
+  };
+
+  // Tessellate one edge, oriented so its first point sits at vertex `startV`
+  // (or, when startV is -1, at its infinite end — the point farthest from its
+  // one finite vertex). Lets us walk a cell's edges into a continuous polyline.
+  const orientedPts = (e, vertices, startV, big) => {
+    const pts = tessellate(e.geometry, { parabolaSamples: 14, infiniteLength: big });
+    const last = pts[pts.length - 1];
+    const c = vertices[startV >= 0 ? startV : (e.from >= 0 ? e.from : e.to)];
+    const d0 = (pts[0].x - c.x) ** 2 + (pts[0].y - c.y) ** 2;
+    const dN = (last.x - c.x) ** 2 + (last.y - c.y) ** 2;
+    // startV>=0: begin at that vertex (nearest end first).
+    // startV<0:  begin at infinity (farthest-from-finite-vertex end first).
+    const beginAtNear = startV >= 0;
+    return (beginAtNear ? d0 <= dN : d0 >= dN) ? pts : pts.slice().reverse();
+  };
+
+  // Chain a cell's edges into one boundary polyline. Returns { pts, bounded }.
+  // Bounded cells form a closed loop; unbounded cells form an open chain whose
+  // first and last points are out near infinity. Returns null for the rare
+  // doubly-infinite ("line") case, which we don't fill.
+  function chainCell(edges, vertices, big) {
+    if (edges.some((e) => e.geometry.type === "line")) return null;
+    const bounded = edges.every((e) => e.from >= 0 && e.to >= 0);
+    const at = new Map();                              // finite vertex -> [edge index]
+    edges.forEach((e, i) => {
+      for (const v of [e.from, e.to]) if (v >= 0) (at.get(v) ?? at.set(v, []).get(v)).push(i);
+    });
+    const used = new Array(edges.length).fill(false);
+    const pts = [];
+
+    // Start at a terminal (infinite-ended) edge if unbounded, else any edge.
+    let cur = bounded ? 0 : edges.findIndex((e) => e.from < 0 || e.to < 0);
+    if (cur < 0) return null;
+    used[cur] = true;
+    const startV = bounded ? edges[cur].from : -1;
+    pts.push(...orientedPts(edges[cur], vertices, startV, big));
+    let tip = bounded
+      ? edges[cur].to
+      : (edges[cur].from >= 0 ? edges[cur].from : edges[cur].to);
+
+    while (tip >= 0 && tip !== startV) {
+      const next = (at.get(tip) ?? []).find((i) => !used[i]);
+      if (next === undefined) break;                   // open/degenerate chain
+      used[next] = true;
+      const e = edges[next];
+      pts.push(...orientedPts(e, vertices, tip, big).slice(1)); // drop duplicate tip
+      tip = (e.from < 0 || e.to < 0) ? -1 : (e.from === tip ? e.to : e.from);
+    }
+    return { pts, bounded };
+  }
+
+  // --- Small geometry helpers for closing & clipping. ---
+  // Liang–Barsky: where the segment from inside-point `pin` leaves rectangle S.
+  const exitOf = (pin, pout, S) => {
+    const dx = pout.x - pin.x, dy = pout.y - pin.y;
+    const p = [-dx, dx, -dy, dy];
+    const q = [pin.x - S.minX, S.maxX - pin.x, pin.y - S.minY, S.maxY - pin.y];
+    let t1 = 1;
+    for (let i = 0; i < 4; i++) {
+      if (p[i] === 0) { if (q[i] < 0) return { ...pout }; continue; }
+      const r = q[i] / p[i];
+      if (p[i] > 0 && r < t1) t1 = r;
+    }
+    return { x: pin.x + t1 * dx, y: pin.y + t1 * dy };
+  };
+  // Parameterize ∂S as t in [0,4): one unit per side, corners at integers.
+  const perimT = (pt, S) => {
+    const eps = 1e-6 * (S.maxX - S.minX + S.maxY - S.minY + 1);
+    if (Math.abs(pt.y - S.minY) < eps) return (pt.x - S.minX) / (S.maxX - S.minX);
+    if (Math.abs(pt.x - S.maxX) < eps) return 1 + (pt.y - S.minY) / (S.maxY - S.minY);
+    if (Math.abs(pt.y - S.maxY) < eps) return 2 + (S.maxX - pt.x) / (S.maxX - S.minX);
+    return 3 + (S.maxY - pt.y) / (S.maxY - S.minY);
+  };
+  // The four corners of ∂S, with their perimeter ids (0..3 ↔ t=0..3).
+  const framesCorners = (S) => [
+    { id: 0, x: S.minX, y: S.minY }, { id: 1, x: S.maxX, y: S.minY },
+    { id: 2, x: S.maxX, y: S.maxY }, { id: 3, x: S.minX, y: S.maxY },
+  ];
+  // Corners lying strictly between params tStart→tEnd, walking ∂S in increasing
+  // t, returned with their ids so a connector can be matched against a target set.
+  const cornersBetween = (tStart, tEnd, corners) => {
+    const span = (tEnd - tStart + 4) % 4;
+    return corners
+      .map((c) => ({ c, rel: (c.id - tStart + 4) % 4 }))
+      .filter((o) => o.rel > 1e-9 && o.rel < span - 1e-9)
+      .sort((a, b) => a.rel - b.rel)
+      .map((o) => o.c);
+  };
+
+  // Close an unbounded cell's open chain against frame S. The cell's boundary
+  // along ∂S is the single arc, between the two exit points, whose corners lie
+  // in the cell — decided by the exact nearest-site test, so we never rely on
+  // an even-odd test of a possibly self-touching polygon. Returns null when the
+  // site can't be measured (segment with an unattributable crossing endpoint).
+  function closeUnbounded(pts, S, site, world) {
+    if (pts.length < 2 || siteDist(site, 0, 0, world) === null) return null;
+    const exitA = exitOf(pts[1], pts[0], S);
+    const exitB = exitOf(pts[pts.length - 2], pts[pts.length - 1], S);
+    const base = [exitA, ...pts.slice(1, -1), exitB];
+    const tA = perimT(exitA, S), tB = perimT(exitB, S);
+    const corners = framesCorners(S);
+
+    // Corner ids that belong to this cell (this site is their nearest feature).
+    const want = new Set(
+      corners
+        .filter((c) => {
+          const eps = 1e-6 * (1 + nearestFeatureDist(c.x, c.y, world));
+          return siteDist(site, c.x, c.y, world) <= nearestFeatureDist(c.x, c.y, world) + eps;
+        })
+        .map((c) => c.id),
+    );
+    // Connector walks exitB → exitA; pick the arc whose corner set is `want`.
+    const inc = cornersBetween(tB, tA, corners);                 // +t direction
+    const dec = cornersBetween(tA, tB, corners).reverse();       // −t direction
+    const ids = (arr) => new Set(arr.map((c) => c.id));
+    const eq = (a) => a.size === want.size && [...want].every((id) => a.has(id));
+    const connector = eq(ids(inc)) ? inc : eq(ids(dec)) ? dec
+      : (inc.every((c) => want.has(c.id)) ? inc : dec);           // fallback
+    return [...base, ...connector];
+  }
+
+  // Sutherland–Hodgman clip of a polygon to an axis-aligned box.
+  function clipToBox(poly, box) {
+    const lerpX = (a, b, X) => ({ x: X, y: a.y + ((X - a.x) / (b.x - a.x)) * (b.y - a.y) });
+    const lerpY = (a, b, Y) => ({ x: a.x + ((Y - a.y) / (b.y - a.y)) * (b.x - a.x), y: Y });
+    const pass = (pts, inside, cut) => {
+      const out = [];
+      for (let i = 0; i < pts.length; i++) {
+        const cur = pts[i], prev = pts[(i + pts.length - 1) % pts.length];
+        const ci = inside(cur), pi = inside(prev);
+        if (ci) { if (!pi) out.push(cut(prev, cur)); out.push(cur); }
+        else if (pi) out.push(cut(prev, cur));
+      }
+      return out;
+    };
+    let p = poly;
+    p = pass(p, (a) => a.x >= box.minX, (a, b) => lerpX(a, b, box.minX)); if (!p.length) return p;
+    p = pass(p, (a) => a.x <= box.maxX, (a, b) => lerpX(a, b, box.maxX)); if (!p.length) return p;
+    p = pass(p, (a) => a.y >= box.minY, (a, b) => lerpY(a, b, box.minY)); if (!p.length) return p;
+    p = pass(p, (a) => a.y <= box.maxY, (a, b) => lerpY(a, b, box.maxY));
+    return p;
+  }
+
+  // One face per site cell, clipped to the canvas and tagged with its component.
+  function extractFaces(result, comp, world) {
+    const { vertices, edges } = result;
+
+    // Frame enclosing every finite Voronoi vertex and the whole canvas, padded
+    // so unbounded cells have room to close outside the drawable region.
+    let minX = 0, minY = 0, maxX = W, maxY = H;
+    for (const v of vertices) {
+      if (!Number.isFinite(v.x) || !Number.isFinite(v.y)) continue;
+      minX = Math.min(minX, v.x); minY = Math.min(minY, v.y);
+      maxX = Math.max(maxX, v.x); maxY = Math.max(maxY, v.y);
+    }
+    const padX = (maxX - minX) * 0.5 + 50, padY = (maxY - minY) * 0.5 + 50;
+    const S = { minX: minX - padX, minY: minY - padY, maxX: maxX + padX, maxY: maxY + padY };
+    const big = (S.maxX - S.minX + S.maxY - S.minY) * 8 + 1e4;
+    const box = { minX: 0, minY: 0, maxX: W, maxY: H };
+
+    // Bucket edges by the two sites each one bisects.
+    const cells = new Map();
+    for (const e of edges) for (const s of e.sites) {
+      const k = siteKey(s);
+      if (k === null) continue;
+      (cells.get(k) ?? cells.set(k, { site: s, edges: [] }).get(k)).edges.push(e);
+    }
+
+    const faces = [];
+    for (const { site, edges: cellEdges } of cells.values()) {
+      const component = siteComponent(site, comp);
+      if (component === null) continue;
+      const chained = chainCell(cellEdges, vertices, big);
+      if (!chained || chained.pts.length < 3) continue;
+
+      let ring = chained.pts;
+      if (!chained.bounded) {
+        ring = closeUnbounded(chained.pts, S, site, world);
+        if (!ring) continue;                            // unattributable → skip
+      }
+      const clipped = clipToBox(ring, box);
+      if (clipped.length >= 3) faces.push({ component, ring: clipped });
+    }
+    return faces;
+  }
+
+  function draw(world, comp, sep, faces) {
     ctx.clearRect(0, 0, W, H);
+    // Compound-shape territories: every cell of a component shares its hue, so
+    // their interior walls disappear and only the green separators remain.
+    for (const f of faces) {
+      if (f.ring.length < 3) continue;
+      ctx.beginPath();
+      ctx.moveTo(f.ring[0].x, f.ring[0].y);
+      for (let i = 1; i < f.ring.length; i++) ctx.lineTo(f.ring[i].x, f.ring[i].y);
+      ctx.closePath();
+      ctx.fillStyle = `hsla(${hueOf(f.component)}, 70%, 55%, 0.12)`;
+      ctx.fill();
+    }
     // Strokes, colored by the component (compound shape) they belong to.
     for (let k = 0; k < world.length; k++) {
       const pts = world[k], hue = hueOf(comp[k]);
@@ -173,19 +432,22 @@
     const { comp, count } = buildComponents(world);
 
     const t0 = performance.now();
-    const { edges } = voronoi({ segments: world });
+    const result = voronoi({ segments: world });
+    const { edges } = result;
     // Keep only bisectors between two different connected components.
     const sep = edges.filter((e) => {
       const a = siteComponent(e.sites[0], comp), b = siteComponent(e.sites[1], comp);
       return a !== null && b !== null && a !== b;
     });
+    // Assemble the Voronoi faces (cells) and tag each with its compound shape.
+    const faces = extractFaces(result, comp, world);
     emaMs = emaMs ? emaMs * 0.9 + (performance.now() - t0) * 0.1 : (performance.now() - t0);
 
-    draw(world, comp, sep);
+    draw(world, comp, sep, faces);
     hud.textContent =
       `${N} crossing strokes → ${count} compound shape${count === 1 ? "" : "s"}\n` +
-      `voronoi(): ${emaMs.toFixed(1)} ms  (~${(1000 / Math.max(emaMs, 1)).toFixed(0)} fps cap)\n` +
-      `separating edges: ${sep.length} / ${edges.length}`;
+      `voronoi()+faces: ${emaMs.toFixed(1)} ms  (~${(1000 / Math.max(emaMs, 1)).toFixed(0)} fps cap)\n` +
+      `faces: ${faces.length}  ·  separating edges: ${sep.length} / ${edges.length}`;
 
     requestAnimationFrame(frame);
   }
