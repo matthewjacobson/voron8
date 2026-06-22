@@ -350,3 +350,60 @@ test("the bare-array form is shorthand for { polygons }", async () => {
   assert.equal(corners.length, 4);
   for (const v of corners) assert.equal(v.source.input, 0);
 });
+
+test("assumeNoIntersections matches the default on intersection-free input", async () => {
+  // A simple polygon, a hole, plus a disjoint open segment — no crossings.
+  const input = {
+    polygons: [
+      [[0, 0], [10, 0], [10, 10], [0, 10]],
+      [[3, 3], [7, 3], [7, 7], [3, 7]],
+    ],
+    segments: [[[20, 0], [20, 10]]],
+  };
+  const slow = voronoi(input);
+  const fast = voronoi(input, { assumeNoIntersections: true });
+
+  assert.equal(fast.vertices.length, slow.vertices.length);
+  assert.equal(fast.edges.length, slow.edges.length);
+  assert.equal(fast.faces.length, slow.faces.length);
+
+  // Same edge geometry, compared order-independently.
+  const key = (r) =>
+    r.edges
+      .map((e) => `${e.geometry.type}:${e.location}`)
+      .sort()
+      .join("|");
+  assert.equal(key(fast), key(slow));
+});
+
+test("assumeNoIntersections throws on crossing segments instead of corrupting", async () => {
+  assert.throws(
+    () =>
+      voronoi(
+        { segments: [[[0, 0], [10, 0]], [[5, -5], [5, 5]]] },
+        { assumeNoIntersections: true },
+      ),
+    /cross or overlap/,
+  );
+});
+
+test("assumeNoIntersections throws on a collinear overlap", async () => {
+  assert.throws(
+    () =>
+      voronoi(
+        { segments: [[[0, 0], [10, 0]], [[5, 0], [15, 0]]] },
+        { assumeNoIntersections: true },
+      ),
+    /cross or overlap/,
+  );
+});
+
+test("assumeNoIntersections allows segments that share only an endpoint", async () => {
+  // A chevron: two segments meeting at (5,5). Shared endpoints are legal.
+  assert.doesNotThrow(() =>
+    voronoi(
+      { segments: [[[0, 0], [5, 5]], [[5, 5], [10, 0]]] },
+      { assumeNoIntersections: true },
+    ),
+  );
+});
