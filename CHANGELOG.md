@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-06-22
+
+### Added
+
+- `voronoi(input, { assumeNoIntersections: true })` — an opt-in fast path for
+  input whose segments do not cross or overlap (a simple polygon, a polygon with
+  holes, any pre-noded planar graph). It uses CGAL's *without-intersections*
+  segment Delaunay traits, which omits the intersection-construction machinery
+  that dominates runtime: each segment–segment crossing otherwise costs ~17 ms
+  on top of ~12 ms per segment, so densely crossing input degrades toward
+  quadratic time. The fast path is ~3× faster even on already-crossing-free
+  input and produces identical output. Because CGAL silently drops an offending
+  segment on a broken promise, voron8 first runs a Shamos–Hoey sweep
+  (O((n + k) log n)) and throws if any two input segments actually cross or
+  overlap (shared endpoints are allowed).
+- `skipIntersectionCheck` option — opt out of that safety sweep when the input
+  is already known to be intersection-free (no effect without
+  `assumeNoIntersections`).
+
+### Changed
+
+- `medialAxis()` now takes `Polygon[]` only (was `Polygon[] | SiteInput`). A
+  medial axis is defined by a filled region, which only closed polygons enclose;
+  isolated points and open polylines were never meaningful input. For a mixed
+  `SiteInput`, call `voronoi()` and filter its edges to the interior ones.
+
 ## [3.1.1] - 2026-06-18
 
 ### Fixed
