@@ -10,6 +10,7 @@
 
 // @ts-ignore — generated single-file Emscripten ESM module (no types).
 import createVoron8Module from "./core/voronoi.js";
+import { findSegmentConflict, type Seg } from "./intersections";
 
 export interface Point {
   x: number;
@@ -23,11 +24,12 @@ export type Polygon = Point[] | Array<[number, number]>;
 export type Polyline = Point[] | Array<[number, number]>;
 
 /**
- * The general input to voronoi()/medialAxis() — any mix of site kinds. The
- * sites are flattened into a single ordered list, in this order: every point,
- * then every segment, then every polygon. `source.input` (below) indexes into
- * that flattened list. Passing a bare `Polygon[]` is shorthand for
- * `{ polygons }`, so the array form's input indices equal the ring indices.
+ * The general input to voronoi() — any mix of site kinds. The sites are
+ * flattened into a single ordered list, in this order: every point, then every
+ * segment, then every polygon. `source.input` (below) indexes into that
+ * flattened list. Passing a bare `Polygon[]` is shorthand for `{ polygons }`,
+ * so the array form's input indices equal the ring indices. (medialAxis() takes
+ * `Polygon[]` only, since a medial axis is defined by a filled region.)
  */
 export interface SiteInput {
   /** Isolated point sites. */
@@ -182,17 +184,53 @@ export interface VoronoiOptions {
    * they agree, so a label whose inputs cross merges into one territory.
    */
   labels?: number[];
+  /**
+   * Fast path for intersection-free input. By default voron8 uses CGAL's
+   * *with-intersections* segment Delaunay traits, which robustly handles
+   * segments that cross or overlap by constructing each intersection point and
+   * inserting it as a new site. That robustness is expensive — every crossing
+   * costs an exact-kernel construction plus a burst of exact-fallback predicates
+   * (the exact kernel is GMP-free MP_Float on WASM), so input with many
+   * mutually-crossing segments degrades toward quadratic time.
+   *
+   * Set `assumeNoIntersections: true` when you can guarantee no two input
+   * segments cross or overlap (e.g. a simple polygon, or a planar graph you have
+   * already noded). voron8 then uses the *without-intersections* traits, which
+   * has none of that machinery and is markedly faster.
+   *
+   * CGAL itself would silently drop an offending segment on a broken promise, so
+   * voron8 first runs a sweep-line scan (O((n+k) log n)) and throws a clear error
+   * if any two input segments cross or overlap (rather than returning a corrupt
+   * diagram). Crossing points (which carry null provenance) never appear under
+   * this path. Set `skipIntersectionCheck` to opt out of that guard.
+   */
+  assumeNoIntersections?: boolean;
+  /**
+   * Skip the intersection guard that protects `assumeNoIntersections` (no effect
+   * otherwise). Use only when the input is *already known* to be
+   * intersection-free and the guard's cost is unwanted — e.g. geometry produced
+   * by an algorithm that cannot create crossings. With this set, crossing or
+   * overlapping input yields a corrupt diagram with no error, exactly as CGAL's
+   * raw without-intersections traits would.
+   */
+  skipIntersectionCheck?: boolean;
 }
+
+type RawResult = {
+  vertices: VoronoiVertex[];
+  edges: Array<{ sites: [SiteRef, SiteRef] } & Record<string, any>>;
+  faces: Array<{ site: SiteRef; unbounded: boolean; boundary: number[] }>;
+  groups: Array<{ label: number; rings: Array<{ unbounded: boolean; boundary: number[] }> }>;
+};
 
 type WasmModule = {
   computeVoronoi: (
     coords: number[], ringSizes: number[], closed: number[], labels: number[],
-  ) => {
-    vertices: VoronoiVertex[];
-    edges: Array<{ sites: [SiteRef, SiteRef] } & Record<string, any>>;
-    faces: Array<{ site: SiteRef; unbounded: boolean; boundary: number[] }>;
-    groups: Array<{ label: number; rings: Array<{ unbounded: boolean; boundary: number[] }> }>;
-  };
+  ) => RawResult;
+  /** Same shape as computeVoronoi, but assumes the input has no crossing/overlapping segments. */
+  computeVoronoiNoIntersections: (
+    coords: number[], ringSizes: number[], closed: number[], labels: number[],
+  ) => RawResult;
 };
 
 let modulePromise: Promise<WasmModule> | null = null;
@@ -309,6 +347,19 @@ function normalizeInput(
   return { sites, fillRings: polygonRings };
 }
 
+/** Expand the (ring, closed) sites into the flat list of edges (segments). */
+function sitesToSegments(
+  sites: Array<{ ring: Array<[number, number]>; closed: boolean }>,
+): Seg[] {
+  const segs: Seg[] = [];
+  for (const { ring, closed } of sites) {
+    const n = ring.length;
+    for (let i = 0; i + 1 < n; i++) segs.push({ a: ring[i], b: ring[i + 1] });
+    if (closed && n >= 2) segs.push({ a: ring[n - 1], b: ring[0] });
+  }
+  return segs;
+}
+
 /**
  * Compute the segment Voronoi diagram of a set of input sites.
  *
@@ -345,7 +396,27 @@ export function voronoi(input: Polygon[] | SiteInput, options: VoronoiOptions = 
     );
   }
 
-  const raw = mod.computeVoronoi(coords, ringSizes, closed, labels);
+  let raw: RawResult;
+  if (options.assumeNoIntersections) {
+    // The without-intersections traits does not detect a broken promise — it
+    // silently drops the offending segment and returns a corrupt diagram — so we
+    // guard it here (unless the caller opts out). The sweep is cheap relative to
+    // the construction it protects.
+    if (!options.skipIntersectionCheck) {
+      const conflict = findSegmentConflict(sitesToSegments(sites));
+      if (conflict) {
+        const [s, t] = conflict;
+        throw new Error(
+          "voron8: assumeNoIntersections was set but two input segments cross or " +
+            `overlap (near [${s.a}]–[${s.b}] and [${t.a}]–[${t.b}]). Drop the flag ` +
+            "to use the robust (slower) path that handles intersections.",
+        );
+      }
+    }
+    raw = mod.computeVoronoiNoIntersections(coords, ringSizes, closed, labels);
+  } else {
+    raw = mod.computeVoronoi(coords, ringSizes, closed, labels);
+  }
 
   const edges: VoronoiEdge[] = raw.edges.map((e: any) => {
     let geometry: EdgeGeometry;
@@ -398,7 +469,7 @@ export function voronoi(input: Polygon[] | SiteInput, options: VoronoiOptions = 
 }
 
 /**
- * The interior medial axis of the filled input region.
+ * The interior medial axis of a filled polygonal region.
  *
  * The medial axis is every interior Voronoi edge *except* the degenerate
  * bisectors between a polygon vertex and one of its own incident edges. Because
@@ -411,16 +482,21 @@ export function voronoi(input: Polygon[] | SiteInput, options: VoronoiOptions = 
  * Returns the same `vertices` as `voronoi()` (so edge `from`/`to` indices stay
  * valid) with `edges` narrowed to the medial axis.
  *
- * The medial axis is defined by the *polygons* in the input; points and open
- * segments still perturb the diagram as sites but contribute no interior, so an
- * input with no polygons yields an empty axis.
+ * Takes polygon rings only — a medial axis is defined by the *filled region*,
+ * which only closed polygons enclose (nested rings act as holes under the
+ * even-odd rule). Isolated points and open polylines enclose no area, so they
+ * are not a meaningful medial-axis input; use {@link voronoi} for those. (For
+ * the full `SiteInput`, call `voronoi({ ... })` and filter its edges yourself.)
  *
  * Synchronous: await init() once before calling this (it throws otherwise).
  *
+ * @param input The polygon rings whose filled region to skeletonize. Each ring
+ *              is closed (the last vertex connects to the first); nested rings
+ *              are holes.
  * @see https://stackoverflow.com/questions/69237154 (Richard's CGAL answer)
  */
-export function medialAxis(input: Polygon[] | SiteInput): VoronoiResult {
-  const result = voronoi(input);
+export function medialAxis(input: Polygon[]): VoronoiResult {
+  const result = voronoi({ polygons: input });
   const edges = result.edges.filter(
     (e) => e.location === "interior" && !isIncidentBisector(e),
   );

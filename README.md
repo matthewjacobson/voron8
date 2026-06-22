@@ -114,7 +114,7 @@ voronoi({
 - Each **polygon** is a closed ring (do **not** repeat the first point at the end); each **segment** is an open chain that is *not* closed; a two-point chain is a single line segment.
 - Sites flatten into one ordered list — **points, then segments, then polygons** — and `source.input` (below) indexes into that list. With the bare-array form, `input` is just the ring index.
 - **Holes / interior:** interior/exterior labeling uses the even-odd fill rule over the **polygons only** (points and open segments enclose no region). A ring nested inside another acts as a hole — edges inside it are `exterior`.
-- **Crossing segments** are allowed: where two segment interiors cross, CGAL inserts the intersection as a new point site. That site is not an input vertex, so it appears with `isInput: false` and a `null` source.
+- **Crossing segments** are allowed: where two segment interiors cross, CGAL inserts the intersection as a new point site. That site is not an input vertex, so it appears with `isInput: false` and a `null` source. Crossings are also the main cost driver — see [Performance](#performance-crossing-segments) for the numbers and an opt-in fast path for intersection-free input.
 
 ## Output
 
@@ -155,7 +155,11 @@ interface VoronoiFace {
   boundary: number[];  // indices into edges[], the cell boundary in CCW order
 }
 
-interface VoronoiOptions { labels?: number[]; }  // one label per input
+interface VoronoiOptions {
+  labels?: number[];               // one label per input (enables `groups`)
+  assumeNoIntersections?: boolean; // fast path; input must be intersection-free
+  skipIntersectionCheck?: boolean; // opt out of the fast path's safety scan
+}
 
 interface CellGroup {
   label: number;          // the caller-supplied label value
@@ -201,10 +205,12 @@ Returns a polyline. Straight edges return their two endpoints; parabolic arcs ar
 ### Medial axis
 
 ```ts
-medialAxis(input: Polygon[] | SiteInput): VoronoiResult; // await init() once first
+medialAxis(input: Polygon[]): VoronoiResult; // await init() once first
 ```
 
-The interior **medial axis** (skeleton) of the filled region: every interior Voronoi edge *except* the degenerate bisectors between a polygon vertex and one of its own incident edges. Because CGAL treats each segment endpoint as its own site, those incident pairs produce perpendicular bisectors that touch the boundary at a single point and aren't part of the skeleton. Everything else is kept — including the parabolic arcs between a reflex vertex and the wall facing it, and bisectors between two reflex vertices. The result shares the same `vertices` as `voronoi()` (so `from`/`to` indices stay valid) with `edges` narrowed to the medial axis. The axis is defined by the **polygons** in the input; points and open segments still perturb the diagram as sites but enclose no region, so an input with no polygons yields an empty axis.
+The interior **medial axis** (skeleton) of the filled region: every interior Voronoi edge *except* the degenerate bisectors between a polygon vertex and one of its own incident edges. Because CGAL treats each segment endpoint as its own site, those incident pairs produce perpendicular bisectors that touch the boundary at a single point and aren't part of the skeleton. Everything else is kept — including the parabolic arcs between a reflex vertex and the wall facing it, and bisectors between two reflex vertices. The result shares the same `vertices` as `voronoi()` (so `from`/`to` indices stay valid) with `edges` narrowed to the medial axis.
+
+`medialAxis()` takes **polygon rings only** — a medial axis is defined by the *filled region*, and only closed polygons enclose area (nested rings act as holes under the even-odd rule). Isolated points and open polylines enclose nothing, so they aren't a meaningful medial-axis input. If you want the skeleton of a mixed `SiteInput`, call `voronoi({ ... })` and filter its edges to the interior ones yourself.
 
 The interactive [medial-axis demo](https://matthewjacobson.github.io/voron8/example/medial-axis.html) runs this over shapes from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive), with three sliders that feature-prune the axis. The pruning follows the rooted-tree model of [micycle1's PGS `MedialAxis`](https://github.com/micycle1/PGS/blob/8231057/src/main/java/micycle/pgs/PGS_Contour.java): the axis is rooted at its widest disk, and three normalized 0..1 thresholds prune it — **axial** (per-edge gradient `d(radius)/d(length)`), **distance** (geodesic distance from the root), and **area** (a subtree's aggregate feature area, normalized per connected component) — each cutting an edge and its whole subtree. It's plain client-side code in [`example/prune.js`](example/prune.js); voron8 itself returns the unpruned axis.
 
@@ -230,6 +236,30 @@ const separating = edges.filter((e) => {
 (A segment site's two endpoints are consecutive vertices of the same input, so either one gives its index; endpoints read `null` only for points CGAL synthesized, e.g. where two segments cross.) The live [compound-Voronoi demo](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html) animates a mix of morphing soft-body blobs, open segments, and points — kept disjoint — and redraws this separation network every frame.
 
 When inputs are allowed to **overlap**, "which shape did this come from" is no longer one input index. The [connected-component demo](https://matthewjacobson.github.io/voron8/example/compound-connected.html) handles that by grouping the inputs into connected components (union-find over shared endpoints and crossings) and treating each component as one compound shape: separators are drawn only between *different* components, so where two strokes cross they merge into a single shape and the boundary between them disappears. This also sidesteps the synthesized crossing point's `null` provenance — that point is interior to the merged shape, so the ambiguous edges around it are exactly the ones that correctly drop out.
+
+## Performance: crossing segments
+
+voron8's running time is dominated by **segment–segment intersections**. The default traits handles crossing and overlapping segments robustly by constructing each intersection point and inserting it as a new site — but on WebAssembly, where the exact fallback kernel is GMP-free `MP_Float`, every crossing is expensive. Measured on disjoint vs. crossing inputs, the cost is almost exactly linear in each:
+
+> **time ≈ 12 ms × (#segments) + 17 ms × (#crossings)**
+
+A plain segment insertion costs ~12 ms; each intersection adds ~17 ms. Because a set of *s* mutually-crossing segments has Θ(*s*²) intersections, densely crossing input degrades toward quadratic time — e.g. 60 segments through a common point takes ~9 s, versus tens of milliseconds when they don't cross. (This is specifically about **crossings**: collinear, overlapping, or duplicate segments are *not* slow — CGAL merges them cheaply.)
+
+### The intersection-free fast path
+
+If you can guarantee the input has **no crossing or overlapping segments** — a simple polygon, a polygon with holes, or any planar graph you've already noded — pass `assumeNoIntersections: true`:
+
+```js
+voronoi({ polygons: [outer, hole] }, { assumeNoIntersections: true });
+```
+
+This selects CGAL's *without-intersections* traits, which omits all the intersection machinery; it's markedly faster (~3× even on already-intersection-free input, and it sidesteps the quadratic blow-up entirely). Segments that merely **touch at a shared endpoint** — like consecutive polygon edges — are fine; only interiors that cross, T-junctions, and collinear overlaps are disallowed.
+
+CGAL would *silently drop* an offending segment on a broken promise, returning a corrupt diagram with no error. So voron8 first runs a **sweep-line scan** (`O((n + k) log n)` for *n* segments) and throws a clear error if any two input segments actually cross or overlap. The scan is cheap next to the construction it guards (microseconds-to-milliseconds even for thousands of segments). If you are *certain* the input is clean and want to skip even that, also pass `skipIntersectionCheck: true` to recover CGAL's raw "trust me" behavior:
+
+```js
+voronoi(input, { assumeNoIntersections: true, skipIntersectionCheck: true });
+```
 
 ## Why an input vertex shows up as a Voronoi vertex
 

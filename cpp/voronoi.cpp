@@ -17,6 +17,19 @@
 // topology; constructions are in double (machine-epsilon coordinate accuracy).
 // Input-corner coincidence still matches exactly because the dual of a corner face
 // is constructed as the corner point itself.
+//
+// Two traits variants are compiled and exposed (see EMSCRIPTEN_BINDINGS at the
+// bottom). The DEFAULT `computeVoronoi` uses the *with-intersections* traits:
+// crossing/overlapping input segments Just Work because CGAL constructs each
+// intersection point and inserts it as a new site. That robustness is costly,
+// though — every crossing forces an exact-kernel construction plus a cluster of
+// exact-fallback predicates around it (~17ms per crossing on WASM, where the exact
+// kernel is the GMP-free MP_Float), so input with many mutually-crossing segments
+// degrades toward quadratic time. `computeVoronoiNoIntersections` uses the
+// *without-intersections* traits: it has no intersection machinery at all (its
+// exact fallback is a division-free MP_Float ring, the configuration that variant
+// is designed around), so it is markedly faster — but the caller must guarantee
+// the input segments do not cross or overlap, or CGAL's preconditions fail.
 
 #include <CGAL/Simple_cartesian.h>
 #include <CGAL/Quotient.h>
@@ -43,27 +56,13 @@
 // Simple_cartesian<Quotient<MP_Float>> under -DCGAL_DISABLE_GMP).
 typedef double                                                      NT;
 typedef CGAL::Simple_cartesian<double>                              CK;
-typedef CGAL::Segment_Delaunay_graph_filtered_traits_2<CK>          Gt;
-typedef CGAL::Segment_Delaunay_graph_2<Gt>                          SDG;
 
-// Voronoi-diagram adaptor over the segment Delaunay graph. It presents the dual
-// directly as faces (one per site) with ordered boundary circulators, so the
-// cells need not be reassembled from the edge soup on the JS side. The
-// degeneracy-removal policy yields a clean diagram (no zero-length edges/merged
-// covertices).
-typedef CGAL::Segment_Delaunay_graph_adaptation_traits_2<SDG>            AT;
-typedef CGAL::Segment_Delaunay_graph_degeneracy_removal_policy_2<SDG>    AP;
-typedef CGAL::Voronoi_diagram_2<SDG, AT, AP>                            VD;
-
-typedef SDG::Point_2       Point_2;
-typedef SDG::Face_handle   Face_handle;
-typedef SDG::Vertex_handle Vertex_handle;
-typedef SDG::Edge          Edge;
-typedef SDG::Site_2        Site_2;
-
-typedef Gt::Line_2    Line_2;
-typedef Gt::Segment_2 Segment_2;
-typedef Gt::Ray_2     Ray_2;
+// Geometry value types are the construction kernel's regardless of which traits
+// variant is used, so the extraction helpers below stay traits-independent.
+typedef CK::Point_2   Point_2;
+typedef CK::Line_2    Line_2;
+typedef CK::Segment_2 Segment_2;
+typedef CK::Ray_2     Ray_2;
 
 namespace {
 
@@ -89,7 +88,8 @@ emscripten::val point_val(const Point_2& p) {
 // edge). Both representations of the edge — (f,i) and its mirror — map here to
 // the same key, so a face's boundary halfedge can look up the emitted edge index
 // via he->dual(). Vertex handles are stable for the lifetime of one call.
-std::pair<const void*, const void*> edge_key(const SDG& sdg, const SDG::Edge& e) {
+template <class SDG>
+std::pair<const void*, const void*> edge_key(const SDG& sdg, const typename SDG::Edge& e) {
   const void* a = &*e.first->vertex(sdg.ccw(e.second));
   const void* b = &*e.first->vertex(sdg.cw(e.second));
   return a < b ? std::make_pair(a, b) : std::make_pair(b, a);
@@ -106,8 +106,6 @@ struct EdgeKeyHash {
   }
 };
 
-} // namespace
-
 // coords:    flat [x0,y0,x1,y1,...] of every ring vertex, rings concatenated.
 // ringSizes: vertex count of each ring, in order. A size-1 ring is an isolated
 //            point site; a size>=2 ring is a polyline/polygon.
@@ -116,8 +114,27 @@ struct EdgeKeyHash {
 // labels:    optional group label per ring (same order). When non-empty, the
 //            result gains `faces`-style outlines of the union of each label's
 //            cells (the compound-Voronoi territories). Empty = no grouping.
-emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringSizesVal,
-                                emscripten::val closedVal, emscripten::val labelsVal) {
+//
+// Templated on the segment Delaunay traits `Gt` so the same body serves both the
+// with- and without-intersections variants (see the two bindings below).
+template <class Gt>
+emscripten::val compute_voronoi_impl(emscripten::val coordsVal, emscripten::val ringSizesVal,
+                                     emscripten::val closedVal, emscripten::val labelsVal) {
+  typedef CGAL::Segment_Delaunay_graph_2<Gt>                              SDG;
+  // Voronoi-diagram adaptor over the segment Delaunay graph. It presents the dual
+  // directly as faces (one per site) with ordered boundary circulators, so the
+  // cells need not be reassembled from the edge soup on the JS side. The
+  // degeneracy-removal policy yields a clean diagram (no zero-length edges/merged
+  // covertices).
+  typedef CGAL::Segment_Delaunay_graph_adaptation_traits_2<SDG>           AT;
+  typedef CGAL::Segment_Delaunay_graph_degeneracy_removal_policy_2<SDG>   AP;
+  typedef CGAL::Voronoi_diagram_2<SDG, AT, AP>                            VD;
+
+  typedef typename SDG::Face_handle   Face_handle;
+  typedef typename SDG::Vertex_handle Vertex_handle;
+  typedef typename SDG::Edge          Edge;
+  typedef typename SDG::Site_2        Site_2;
+
   const std::vector<double> coords =
       emscripten::convertJSArrayToNumberVector<double>(coordsVal);
   const std::vector<int> ringSizes =
@@ -329,8 +346,8 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
   emscripten::val faces = emscripten::val::array();
   int fIdx = 0;
   for (auto fit = vd.faces_begin(); fit != vd.faces_end(); ++fit) {
-    std::vector<VD::Halfedge_handle> hes;
-    VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
+    std::vector<typename VD::Halfedge_handle> hes;
+    typename VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
     do { hes.push_back(ccb); } while (++ccb != done);
 
     bool unbounded = false;
@@ -343,7 +360,7 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     emscripten::val boundary = emscripten::val::array();
     int bIdx = 0;
     for (std::size_t k = 0; k < hes.size(); ++k) {
-      VD::Halfedge_handle he = hes[(startAt + k) % hes.size()];
+      typename VD::Halfedge_handle he = hes[(startAt + k) % hes.size()];
       auto hit = edgeIndex.find(edge_key(sdg, he->dual()));
       if (hit == edgeIndex.end()) continue;  // edge was skipped above — defensive
       boundary.set(bIdx++, hit->second);
@@ -402,7 +419,7 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
       const void* key = &*fit->dual();
       if (groupId[key] != -1) continue;
       unlabeled.push_back(key);
-      VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
+      typename VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
       do { nbrs[key].push_back(&*ccb->opposite()->face()->dual()); } while (++ccb != done);
     }
     // Policy (b): an unlabeled (crossing) cell adopts label L when all of its
@@ -430,8 +447,8 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
     for (const void* f : unlabeled) if (groupId[f] == -1) groupId[f] = nextId++;
 
     const int K = static_cast<int>(idToLabel.size());
-    auto labelOf = [&](VD::Halfedge_handle h) { return groupId[&*h->face()->dual()]; };
-    auto edgeOf = [&](VD::Halfedge_handle h) -> int {
+    auto labelOf = [&](typename VD::Halfedge_handle h) { return groupId[&*h->face()->dual()]; };
+    auto edgeOf = [&](typename VD::Halfedge_handle h) -> int {
       auto it = edgeIndex.find(edge_key(sdg, h->dual()));
       return it == edgeIndex.end() ? -1 : it->second;
     };
@@ -452,23 +469,23 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
       auto sF = fit->dual();                         // this cell's site
       const int gid = groupId[&*sF];
       if (gid < 0 || gid >= K) continue;             // singleton/junction cells own no group
-      VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
+      typename VD::Ccb_halfedge_circulator ccb = fit->ccb(), done = ccb;
       do {
-        VD::Halfedge_handle h = ccb;
+        typename VD::Halfedge_handle h = ccb;
         auto nb = (h->up() == sF) ? h->down() : h->up();  // neighbour cell's site
         if (groupId[&*nb] == gid) continue;          // interior edge, not a frontier
         const int e0 = edgeOf(h);
         if (e0 < 0) continue;                         // unreferenced edge — defensive
         if (!seen.insert(static_cast<uint64_t>(e0) * K + gid).second) continue;  // ring done
 
-        std::vector<std::pair<VD::Halfedge_handle, int>> hs;  // (halfedge, edge index)
-        VD::Halfedge_handle e = h;
+        std::vector<std::pair<typename VD::Halfedge_handle, int>> hs;  // (halfedge, edge index)
+        typename VD::Halfedge_handle e = h;
         int guard = 0;
         do {
           const int ei = edgeOf(e);
           hs.emplace_back(e, ei);
           if (ei >= 0) seen.insert(static_cast<uint64_t>(ei) * K + gid);
-          VD::Halfedge_handle n = e->next();
+          typename VD::Halfedge_handle n = e->next();
           while (labelOf(n->opposite()) == gid) n = n->opposite()->next();
           e = n;
         } while (e != h && ++guard < 1000000);
@@ -510,6 +527,25 @@ emscripten::val compute_voronoi(emscripten::val coordsVal, emscripten::val ringS
   return result;
 }
 
+// The two traits variants. The filtered traits already supports intersecting
+// segments (it is the WITH-intersections variant); the without-intersections
+// sibling drops that machinery for speed but requires intersection-free input.
+typedef CGAL::Segment_Delaunay_graph_filtered_traits_2<CK>                       Gt_with;
+typedef CGAL::Segment_Delaunay_graph_filtered_traits_without_intersections_2<CK> Gt_without;
+
+emscripten::val compute_voronoi(emscripten::val coords, emscripten::val ringSizes,
+                                emscripten::val closed, emscripten::val labels) {
+  return compute_voronoi_impl<Gt_with>(coords, ringSizes, closed, labels);
+}
+
+emscripten::val compute_voronoi_no_intersections(emscripten::val coords, emscripten::val ringSizes,
+                                                 emscripten::val closed, emscripten::val labels) {
+  return compute_voronoi_impl<Gt_without>(coords, ringSizes, closed, labels);
+}
+
+} // namespace
+
 EMSCRIPTEN_BINDINGS(voron8) {
   emscripten::function("computeVoronoi", &compute_voronoi);
+  emscripten::function("computeVoronoiNoIntersections", &compute_voronoi_no_intersections);
 }
