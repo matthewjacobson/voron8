@@ -1,6 +1,6 @@
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { voronoi, medialAxis, tessellate, init } from "../dist/voron8.js";
+import { voronoi, medialAxis, tessellate, componentAdjacency, init } from "../dist/voron8.js";
 
 // voronoi()/medialAxis() are synchronous; load the wasm once up front.
 before(() => init());
@@ -405,5 +405,92 @@ test("assumeNoIntersections allows segments that share only an endpoint", async 
       { segments: [[[0, 0], [5, 5]], [[5, 5], [10, 0]]] },
       { assumeNoIntersections: true },
     ),
+  );
+});
+
+test("componentAdjacency: two separate segments are one adjacent pair", async () => {
+  // Two parallel segments, each its own connected component.
+  const { componentCount, vertexComponent, adjacency, pairs } = componentAdjacency({
+    vertices: [[0, 0], [4, 0], [0, 5], [4, 5]],
+    edges: [[0, 1], [2, 3]],
+  });
+  assert.equal(componentCount, 2);
+  assert.deepEqual(vertexComponent, [0, 0, 1, 1]);
+  assert.deepEqual(adjacency, [[1], [0]]);
+  assert.deepEqual(pairs, [[0, 1]]);
+});
+
+test("componentAdjacency: a single connected graph has no adjacencies", async () => {
+  // A triangle is one component; every Voronoi edge is intra-component.
+  const { componentCount, vertexComponent, adjacency, pairs } = componentAdjacency({
+    vertices: [[0, 0], [4, 0], [2, 3]],
+    edges: [[0, 1], [1, 2], [2, 0]],
+  });
+  assert.equal(componentCount, 1);
+  assert.deepEqual(vertexComponent, [0, 0, 0]);
+  assert.deepEqual(adjacency, [[]]);
+  assert.deepEqual(pairs, []);
+});
+
+test("componentAdjacency: a path of two edges sharing a vertex is one component", async () => {
+  // Shared endpoints are legal (no T-junction); the two edges are connected.
+  const { componentCount, pairs } = componentAdjacency({
+    vertices: [[0, 0], [1, 0], [2, 0]],
+    edges: [[0, 1], [1, 2]],
+  });
+  assert.equal(componentCount, 1);
+  assert.deepEqual(pairs, []);
+});
+
+test("componentAdjacency: isolated points are singleton components", async () => {
+  // Three collinear points: the middle cell separates the two ends, so the ends
+  // are not adjacent to each other.
+  const { componentCount, vertexComponent, pairs } = componentAdjacency({
+    vertices: [[0, 0], [10, 0], [20, 0]],
+    edges: [],
+  });
+  assert.equal(componentCount, 3);
+  assert.deepEqual(vertexComponent, [0, 1, 2]);
+  assert.deepEqual(pairs, [[0, 1], [1, 2]]);
+});
+
+test("componentAdjacency: mixed isolated point and segments adjoin", async () => {
+  // A point between two segments — point is its own component (#0, points first).
+  const { componentCount, vertexComponent } = componentAdjacency({
+    vertices: [[5, 5], [0, 0], [0, 10], [10, 0], [10, 10]],
+    edges: [[1, 2], [3, 4]],
+  });
+  assert.equal(componentCount, 3);
+  // Vertex 0 (isolated) is its own component; the two segments are the others.
+  assert.equal(vertexComponent[0], vertexComponent[0]);
+  assert.equal(vertexComponent[1], vertexComponent[2]);
+  assert.equal(vertexComponent[3], vertexComponent[4]);
+  assert.notEqual(vertexComponent[1], vertexComponent[3]);
+});
+
+test("componentAdjacency: crossing edges throw (not a valid PSLG)", async () => {
+  assert.throws(
+    () =>
+      componentAdjacency({
+        vertices: [[0, 0], [4, 4], [0, 4], [4, 0]],
+        edges: [[0, 1], [2, 3]], // an X — cross at (2,2)
+      }),
+    /planar straight line graph|cross|noded/i,
+  );
+});
+
+test("componentAdjacency: duplicate and self-loop edges are tolerated", async () => {
+  const { componentCount, pairs } = componentAdjacency({
+    vertices: [[0, 0], [1, 0]],
+    edges: [[0, 1], [1, 0], [0, 0]], // duplicate (reversed) + a self-loop
+  });
+  assert.equal(componentCount, 1);
+  assert.deepEqual(pairs, []);
+});
+
+test("componentAdjacency: out-of-range edge index throws", async () => {
+  assert.throws(
+    () => componentAdjacency({ vertices: [[0, 0], [1, 0]], edges: [[0, 5]] }),
+    /out-of-range/,
   );
 });
