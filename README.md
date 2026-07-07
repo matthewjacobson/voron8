@@ -6,6 +6,7 @@ The segment **Voro**noi diagram of points, segments, and polygons, computed by [
 
 - **[Voronoi demo →](https://matthewjacobson.github.io/voron8/example/)**
 - **[Medial-axis demo →](https://matthewjacobson.github.io/voron8/example/medial-axis.html)** (pick a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive))
+- **[Path-finder demo →](https://matthewjacobson.github.io/voron8/example/pathfinder.html)** (drag the endpoints, add walls, watch the medial-axis route re-solve)
 - **[Compound-Voronoi demo →](https://matthewjacobson.github.io/voron8/example/compound-voronoi.html)** (live soft-body blobs, points & open segments — disjoint mixed input)
 - **[Connected-component demo →](https://matthewjacobson.github.io/voron8/example/compound-connected.html)** (overlapping strokes that merge into compound shapes when they cross)
 - **[CDN/UMD demo →](https://matthewjacobson.github.io/voron8/example/cdn-umd.html)** (no build step)
@@ -213,6 +214,38 @@ The interior **medial axis** (skeleton) of the filled region: every interior Vor
 `medialAxis()` takes **polygon rings only** — a medial axis is defined by the *filled region*, and only closed polygons enclose area (nested rings act as holes under the even-odd rule). Isolated points and open polylines enclose nothing, so they aren't a meaningful medial-axis input. If you want the skeleton of a mixed `SiteInput`, call `voronoi({ ... })` and filter its edges to the interior ones yourself.
 
 The interactive [medial-axis demo](https://matthewjacobson.github.io/voron8/example/medial-axis.html) runs this over shapes from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive), with three sliders that feature-prune the axis. The pruning follows the rooted-tree model of [micycle1's PGS `MedialAxis`](https://github.com/micycle1/PGS/blob/8231057/src/main/java/micycle/pgs/PGS_Contour.java): the axis is rooted at its widest disk, and three normalized 0..1 thresholds prune it — **axial** (per-edge gradient `d(radius)/d(length)`), **distance** (geodesic distance from the root), and **area** (a subtree's aggregate feature area, normalized per connected component) — each cutting an edge and its whole subtree. It's plain client-side code in [`example/prune.js`](example/prune.js); voron8 itself returns the unpruned axis.
+
+### Medial-axis path finder
+
+`MedialAxisPathFinder` routes between two points along the medial axis of a polygon with holes, staying maximally clear of every boundary and wall. Unlike the other entry points it is **stateful and incremental**: walls (segments the path may not cross) are inserted one at a time into a live segment Delaunay graph — the diagram is *not* rebuilt from scratch — and repeated queries between insertions reuse a cached medial graph.
+
+```ts
+class MedialAxisPathFinder {
+  constructor(polygon: Polygon[]); // await init() once first; ring 0 outer, nested rings are holes
+  addWall(a: Point | [number, number], b: Point | [number, number]): void;
+  findPath(
+    start: Point | [number, number],
+    end: Point | [number, number],
+  ): { found: boolean; path: Point[]; length: number };
+  dispose(): void; // free the underlying C++ object
+}
+```
+
+```js
+await init();
+const finder = new MedialAxisPathFinder([outerRing, holeRing]);
+finder.addWall([50, 0], [50, 60]); // a wall poking in from the bottom edge
+const { found, path, length } = finder.findPath({ x: 5, y: 50 }, { x: 95, y: 50 });
+// `path` is a polyline (parabolic arcs sampled); it detours around the hole and
+// the wall. If a wall fully partitions the region, `found` is false.
+finder.dispose();
+```
+
+The **whole finder runs in C++/WASM** — graph extraction, endpoint attachment, and the Dijkstra search — so adding a wall or querying a path never marshals the full diagram across the JS boundary; only the resulting polyline comes back. Each endpoint is attached to the axis by finding the Voronoi cell that contains it and jumping, with a straight connector, to the closest **interior** feature bounding that cell — either an edge whose endpoints are not polygon corners, or an interior branch **vertex**. Considering vertices as well as edges keeps the connector on the skeleton's "spine" rather than on a short boundary stub near a corner, and it also handles a convex region (whose every edge touches the boundary but whose central branch vertex is interior — the connector jumps straight there). Only when a cell offers no interior feature at all does it fall back to the nearest boundary edge. Because walls are Voronoi sites the axis never crosses, a wall that fully separates two regions makes them unreachable (`found: false`) — the "cannot be crossed" guarantee is structural, not a post-hoc check.
+
+Call `dispose()` when finished: the finder holds an [embind](https://emscripten.org/docs/porting/connecting_cpp_and_javascript/embind.html) object that JavaScript's garbage collector cannot reclaim on its own.
+
+The interactive [path-finder demo](https://matthewjacobson.github.io/voron8/example/pathfinder.html) ([`example/pathfinder.html`](example/pathfinder.html)) loads a shape from the [interesting-polygon-archive](https://github.com/LingDong-/interesting-polygon-archive): drag the green/red endpoints to re-route in real time, switch to "add wall" to drop barriers the path must avoid, and toggle the medial-axis overlay.
 
 ### Edges that separate two polygons
 

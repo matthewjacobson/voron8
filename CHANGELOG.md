@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-07-07
+
+### Added
+
+- `MedialAxisPathFinder` — a stateful, incremental point-to-point path finder
+  that routes along the medial axis of a polygon with holes. Construct it from
+  the polygon rings, insert *walls* (segments the path may not cross) one at a
+  time with `addWall()` — each is inserted into a live segment Delaunay graph in
+  place, not rebuilt — and call `findPath(start, end)` to get
+  `{ found, path, length }`, the route as a polyline (parabolic arcs sampled).
+  Each endpoint is attached to the axis by locating the Voronoi cell that
+  contains it and jumping to the closest interior feature bounding that cell —
+  an edge not touching a polygon corner *or a wall endpoint*, or an interior
+  branch vertex — so the connector reaches the skeleton's spine rather than a
+  short boundary stub (considering vertices also covers a convex region, whose
+  only interior feature is its central branch vertex). A wall's endpoints are
+  treated as boundary corners exactly like the polygon's, so the clearance-0
+  stubs a wall introduces (e.g. where it meets the outer boundary) are skipped
+  during attachment just as polygon-corner stubs are. Attachment also rejects
+  any candidate whose straight connector would cross a wall: a wall's Voronoi
+  cell straddles both of its sides, so a point next to a wall could otherwise
+  attach to a feature on the far side (a different medial component when the
+  wall splits the axis) and report a spurious "no path" between two points that
+  are plainly connected on the same side.
+  The whole finder — medial-graph extraction, endpoint attachment, and the
+  Dijkstra search — runs in C++/WASM, so adding a wall or querying a path never
+  marshals the diagram across the JS boundary; the derived graph is cached and
+  recomputed only after a wall is added. Because walls are Voronoi sites the axis
+  never crosses, a wall that fully partitions the region makes the two sides
+  unreachable (`found: false`). Call `dispose()` to free the underlying object.
+
 ## [3.3.0] - 2026-06-29
 
 ### Added
@@ -172,6 +203,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   WebAssembly, with interior/exterior edge labeling, input-vertex provenance,
   `medialAxis()`, and `tessellate()`.
 
+[3.4.0]: https://github.com/matthewjacobson/voron8/compare/v3.3.0...v3.4.0
+[3.3.0]: https://github.com/matthewjacobson/voron8/compare/v3.2.0...v3.3.0
+[3.2.0]: https://github.com/matthewjacobson/voron8/compare/v3.1.1...v3.2.0
 [3.1.1]: https://github.com/matthewjacobson/voron8/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/matthewjacobson/voron8/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/matthewjacobson/voron8/compare/v2.0.3...v3.0.0

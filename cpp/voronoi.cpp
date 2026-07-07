@@ -45,11 +45,16 @@
 #include <emscripten/val.h>
 
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
 #include <vector>
 #include <utility>
+#include <queue>
+#include <cmath>
+#include <limits>
+#include <algorithm>
 
 // Construction kernel: double (fast, machine-epsilon coordinates). The filtered
 // traits supplies its own interval filter (FK) and exact fallback (EK defaults to
@@ -543,9 +548,580 @@ emscripten::val compute_voronoi_no_intersections(emscripten::val coords, emscrip
   return compute_voronoi_impl<Gt_without>(coords, ringSizes, closed, labels);
 }
 
+// ===========================================================================
+// Incremental medial-axis path finder.
+//
+// A stateful class over a *live* segment Delaunay graph. The polygon (with
+// holes) is inserted once at construction; walls — segments the path may not
+// cross — are inserted incrementally with addWall() (CGAL's insert() updates
+// the graph in place, no rebuild). findPath() derives the interior medial axis
+// from the current graph (rebuilt lazily, only when a wall has been added since
+// the last query), connects the start/end points to it, and runs Dijkstra.
+//
+// The whole path finder lives in C++ so that adding a wall or routing a path
+// never marshals the entire diagram across the JS boundary — only the final
+// polyline is returned. The with-intersections traits is used so that walls
+// which happen to cross each other or the boundary are handled robustly.
+// ===========================================================================
+
+typedef CGAL::Segment_Delaunay_graph_2<Gt_with> PF_SDG;
+
+double sqdist(const Point_2& a, const Point_2& b) {
+  const double dx = a.x() - b.x(), dy = a.y() - b.y();
+  return dx * dx + dy * dy;
+}
+
+double polyline_len(const std::vector<Point_2>& poly) {
+  double len = 0;
+  for (std::size_t i = 0; i + 1 < poly.size(); ++i)
+    len += std::sqrt(sqdist(poly[i], poly[i + 1]));
+  return len;
+}
+
+// Even-odd point-in-region test over the polygon fill rings (holes are the
+// even-nesting regions), matching insideFilledRegion() in the JS layer.
+bool inside_fill(double px, double py, const std::vector<std::vector<Point_2>>& rings) {
+  bool inside = false;
+  for (const auto& ring : rings) {
+    const std::size_t n = ring.size();
+    if (n < 3) continue;
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
+      const double xi = ring[i].x(), yi = ring[i].y();
+      const double xj = ring[j].x(), yj = ring[j].y();
+      const bool crosses = ((yi > py) != (yj > py)) &&
+                           (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+      if (crosses) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// Sample a parabolic bisector between p1 and p2 into a polyline, using the same
+// directrix-frame formula as the JS tessellate() (β = (α²−δ²)/(2δ)).
+void sample_parabola(const Point_2& F, double la, double lb, double lc,
+                     const Point_2& p1, const Point_2& p2, int samples,
+                     std::vector<Point_2>& out) {
+  double nlen = std::hypot(la, lb);
+  if (nlen == 0) nlen = 1;
+  const double nx = la / nlen, ny = lb / nlen;
+  const double ux = -ny, uy = nx;
+  const double Fx = F.x(), Fy = F.y();
+  const double delta = (la * Fx + lb * Fy + lc) / nlen;
+  if (delta == 0) { out.push_back(p1); out.push_back(p2); return; }
+  auto proj = [&](const Point_2& p) { return (p.x() - Fx) * ux + (p.y() - Fy) * uy; };
+  const double a0 = proj(p1), a1 = proj(p2);
+  for (int i = 0; i < samples; ++i) {
+    const double alpha = a0 + (a1 - a0) * i / (samples - 1);
+    const double beta = (alpha * alpha - delta * delta) / (2 * delta);
+    out.emplace_back(Fx + alpha * ux + beta * nx, Fy + alpha * uy + beta * ny);
+  }
+}
+
+// True when open segments ab and cd properly cross (interiors intersect at a
+// single point). Endpoint touching and collinear overlap return false, so a
+// connector may reach a point that merely coincides with a wall endpoint.
+bool segments_properly_cross(const Point_2& a, const Point_2& b,
+                             const Point_2& c, const Point_2& d) {
+  auto side = [](const Point_2& p, const Point_2& q, const Point_2& r) {
+    return (q.x() - p.x()) * (r.y() - p.y()) - (q.y() - p.y()) * (r.x() - p.x());
+  };
+  const double d1 = side(c, d, a), d2 = side(c, d, b);
+  const double d3 = side(a, b, c), d4 = side(a, b, d);
+  return d1 * d2 < 0 && d3 * d4 < 0;
+}
+
+// Closest point on a polyline to (x,y): the projection q, the index of the
+// segment it lies on, and the (squared) distance.
+struct Proj { double d2; Point_2 q; int seg; };
+Proj project_polyline(double x, double y, const std::vector<Point_2>& poly) {
+  Proj best{std::numeric_limits<double>::infinity(), poly.empty() ? Point_2(x, y) : poly[0], 0};
+  for (std::size_t i = 0; i + 1 < poly.size(); ++i) {
+    const double ax = poly[i].x(), ay = poly[i].y();
+    const double bx = poly[i + 1].x(), by = poly[i + 1].y();
+    const double dx = bx - ax, dy = by - ay;
+    const double len2 = dx * dx + dy * dy;
+    double t = len2 > 0 ? ((x - ax) * dx + (y - ay) * dy) / len2 : 0;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    const double qx = ax + t * dx, qy = ay + t * dy;
+    const double d2 = (x - qx) * (x - qx) + (y - qy) * (y - qy);
+    if (d2 < best.d2) { best.d2 = d2; best.q = Point_2(qx, qy); best.seg = static_cast<int>(i); }
+  }
+  return best;
+}
+
+class MedialPathFinder {
+ public:
+  typedef PF_SDG::Face_handle    Face_handle;
+  typedef PF_SDG::Vertex_handle  Vertex_handle;
+  typedef PF_SDG::Edge           Edge;
+  typedef PF_SDG::Edge_circulator Edge_circulator;
+  typedef PF_SDG::Site_2         Site_2;
+
+  // coords/ringSizes describe the polygon exactly like computeVoronoi's inputs,
+  // but every ring is a closed polygon (outer boundary plus holes). The rings
+  // both seed the Delaunay graph and define the filled region for the interior
+  // test that selects medial edges.
+  MedialPathFinder(emscripten::val coordsVal, emscripten::val ringSizesVal) : dirty_(true) {
+    const std::vector<double> coords =
+        emscripten::convertJSArrayToNumberVector<double>(coordsVal);
+    const std::vector<int> ringSizes =
+        emscripten::convertJSArrayToNumberVector<int>(ringSizesVal);
+
+    std::vector<Point_2> pts;
+    std::vector<std::pair<std::size_t, std::size_t>> idx;
+    std::size_t cursor = 0;
+    for (int r = 0; r < static_cast<int>(ringSizes.size()); ++r) {
+      const int n = ringSizes[r];
+      if (n <= 0) continue;
+      const std::size_t base = pts.size();
+      std::vector<Point_2> ring;
+      for (int v = 0; v < n; ++v) {
+        Point_2 p(coords[cursor], coords[cursor + 1]);
+        cursor += 2;
+        pts.push_back(p);
+        ring.push_back(p);
+        boundaryVerts_.insert(p);  // polygon corners — where the axis touches the boundary
+      }
+      fillRings_.push_back(ring);
+      for (int v = 0; v + 1 < n; ++v) idx.emplace_back(base + v, base + v + 1);
+      if (n >= 2) idx.emplace_back(base + (n - 1), base + 0);  // close the ring
+    }
+    if (!idx.empty()) sdg_.insert_segments(pts, idx.begin(), idx.end());
+  }
+
+  // Insert a wall segment the path may not cross. Incremental: the Delaunay
+  // graph is updated in place; only the derived medial graph is invalidated.
+  void addWall(double x1, double y1, double x2, double y2) {
+    sdg_.insert(Point_2(x1, y1), Point_2(x2, y2));
+    // Keep the wall segment so endpoint attachment can reject connectors that
+    // would cross it (which would attach a point to the far side of the wall).
+    walls_.emplace_back(Point_2(x1, y1), Point_2(x2, y2));
+    // A wall's endpoints are boundary corners just like the polygon's: the
+    // Voronoi vertices sitting on them (clearance 0) anchor short stubs that
+    // are not the skeleton's spine. Record them so endpoint attachment skips
+    // those stubs in favour of the interior spine (see connectPoint / the
+    // onBoundary_ preference), exactly as it does for polygon corners.
+    boundaryVerts_.insert(Point_2(x1, y1));
+    boundaryVerts_.insert(Point_2(x2, y2));
+    dirty_ = true;
+  }
+
+  // Route from (sx,sy) to (ex,ey) along the medial axis. Returns
+  // { found, path: [{x,y}...], length }.
+  emscripten::val findPath(double sx, double sy, double ex, double ey) {
+    if (dirty_) rebuild();
+
+    emscripten::val result = emscripten::val::object();
+    emscripten::val path = emscripten::val::array();
+
+    // Working graph = a copy of the cached medial adjacency, extended with the
+    // temporary start/end/projection nodes and the connector edges.
+    std::vector<std::vector<Adj>> g = adj_;
+    std::vector<std::vector<Point_2>> tempPolys;
+
+    int chosenS = -1, qS = -1, chosenE = -1, qE = -1;
+    const int S = connectPoint(sx, sy, g, tempPolys, chosenS, qS);
+    const int T = connectPoint(ex, ey, g, tempPolys, chosenE, qE);
+
+    if (qS < 0 || qE < 0) {  // no medial axis to attach to
+      result.set("found", false);
+      result.set("path", path);
+      result.set("length", 0.0);
+      return result;
+    }
+
+    // If both endpoints project onto the *same* medial edge, join their two
+    // projection nodes directly by the sub-arc between them, so a short hop does
+    // not detour out to a shared edge endpoint.
+    if (chosenS >= 0 && chosenS == chosenE && qS != qE) {
+      const std::vector<Point_2>& poly = medialEdges_[chosenS].poly;
+      Proj a = project_polyline(sx, sy, poly);
+      Proj b = project_polyline(ex, ey, poly);
+      std::vector<Point_2> arc;
+      buildArc(poly, a, b, arc);
+      addTemp(g, tempPolys, qS, qE, arc, polyline_len(arc));
+    }
+
+    // Dijkstra from S to T over g.
+    const int nodes = static_cast<int>(g.size());
+    std::vector<double> dist(nodes, std::numeric_limits<double>::infinity());
+    std::vector<int> prevNode(nodes, -1);
+    std::vector<Adj> prevAdj(nodes);
+    typedef std::pair<double, int> QN;
+    std::priority_queue<QN, std::vector<QN>, std::greater<QN>> pq;
+    dist[S] = 0;
+    pq.push({0.0, S});
+    while (!pq.empty()) {
+      auto [d, u] = pq.top();
+      pq.pop();
+      if (d > dist[u]) continue;
+      if (u == T) break;
+      for (const Adj& a : g[u]) {
+        const double nd = d + a.w;
+        if (nd < dist[a.to]) {
+          dist[a.to] = nd;
+          prevNode[a.to] = u;
+          prevAdj[a.to] = a;
+          pq.push({nd, a.to});
+        }
+      }
+    }
+
+    if (!std::isfinite(dist[T])) {  // start and end separated by walls/holes
+      result.set("found", false);
+      result.set("path", path);
+      result.set("length", 0.0);
+      return result;
+    }
+
+    // Reconstruct the polyline: gather each edge oriented prev->cur, from T back
+    // to S, then reverse and concatenate (dropping duplicated shared vertices).
+    std::vector<std::vector<Point_2>> segs;
+    for (int cur = T; cur != S; cur = prevNode[cur]) {
+      const Adj& a = prevAdj[cur];
+      std::vector<Point_2> poly;
+      if (a.edgeId >= 0) {
+        poly = medialEdges_[a.edgeId].poly;  // oriented from->to
+        if (a.reversed) std::reverse(poly.begin(), poly.end());
+      } else {
+        poly = tempPolys[a.tempPoly];  // already oriented prev->cur
+      }
+      segs.push_back(std::move(poly));
+    }
+    std::reverse(segs.begin(), segs.end());
+
+    int k = 0;
+    for (const auto& seg : segs) {
+      for (const Point_2& p : seg) {
+        if (k > 0) {
+          emscripten::val prev = path[k - 1];
+          if (prev["x"].as<double>() == p.x() && prev["y"].as<double>() == p.y()) continue;
+        }
+        emscripten::val pv = emscripten::val::object();
+        pv.set("x", to_double(p.x()));
+        pv.set("y", to_double(p.y()));
+        path.set(k++, pv);
+      }
+    }
+
+    result.set("found", true);
+    result.set("path", path);
+    result.set("length", dist[T]);
+    return result;
+  }
+
+ private:
+  // A kept medial-axis edge: its two endpoint node ids and the polyline geometry
+  // (oriented from `from` to `to`; a segment is two points, a parabola sampled).
+  struct MEdge { int from, to; double weight; std::vector<Point_2> poly; };
+  // A working-graph adjacency entry. For a cached medial edge, edgeId indexes
+  // medialEdges_ and reversed says whether to flip its polyline for this
+  // direction. For a temporary connector, edgeId is -1 and tempPoly indexes the
+  // per-call polyline list (already oriented in this direction).
+  struct Adj { int to; double w; int edgeId; bool reversed; int tempPoly; };
+
+  // Rebuild the cached medial-axis graph from the current Delaunay graph. Nodes
+  // are the finite Voronoi vertices (duals of finite faces); edges are the
+  // interior, non-incident bisectors between them.
+  void rebuild() {
+    faceNode_.clear();
+    nodePos_.clear();
+    onBoundary_.clear();
+    medialEdges_.clear();
+    edgeLookup_.clear();
+    adj_.clear();
+
+    for (auto fit = sdg_.finite_faces_begin(); fit != sdg_.finite_faces_end(); ++fit) {
+      Face_handle f = fit;
+      const Point_2 vp = sdg_.primal(f);
+      faceNode_[f] = static_cast<int>(nodePos_.size());
+      nodePos_.push_back(vp);
+      // A Voronoi vertex coincident with a polygon corner sits on the boundary
+      // (clearance 0); its incident edges are the axis's boundary stubs. Endpoint
+      // attachment prefers to skip these in favour of the interior "spine".
+      onBoundary_.push_back(boundaryVerts_.count(vp) != 0 ? 1 : 0);
+    }
+    adj_.resize(nodePos_.size());
+
+    for (auto eit = sdg_.finite_edges_begin(); eit != sdg_.finite_edges_end(); ++eit) {
+      Edge e = *eit;
+      Face_handle f1 = e.first;
+      Face_handle f2 = e.first->neighbor(e.second);
+      auto i1 = faceNode_.find(f1), i2 = faceNode_.find(f2);
+      // An edge with an endpoint at infinity is an unbounded ray/line — always
+      // exterior, never part of the interior medial axis.
+      if (sdg_.is_infinite(f1) || sdg_.is_infinite(f2) ||
+          i1 == faceNode_.end() || i2 == faceNode_.end())
+        continue;
+
+      Vertex_handle va = e.first->vertex(sdg_.ccw(e.second));
+      Vertex_handle vb = e.first->vertex(sdg_.cw(e.second));
+
+      CGAL::Object o = sdg_.primal(e);
+      Segment_2 seg;
+      CGAL::Parabola_segment_2<Gt_with> parc;
+      std::vector<Point_2> poly;
+      if (CGAL::assign(seg, o)) {
+        poly.push_back(seg.source());
+        poly.push_back(seg.target());
+      } else if (CGAL::assign(parc, o)) {
+        const Line_2& dl = parc.line();
+        sample_parabola(parc.center(), to_double(dl.a()), to_double(dl.b()), to_double(dl.c()),
+                        parc.p1, parc.p2, 16, poly);
+      } else {
+        continue;  // ray/line/unknown — unbounded, skip
+      }
+      if (poly.size() < 2) continue;
+
+      // Interior test on a representative point: the midpoint of the polyline's
+      // central sub-segment. For a straight edge (2 points) that is the true
+      // midpoint; for a sampled parabola it is a near-on-curve central point.
+      // (Sampling a raw polyline *vertex* is wrong — an endpoint is a Voronoi
+      // vertex that often lies exactly on the boundary, where the even-odd test
+      // is unstable, which would drop genuine interior edges and disconnect the
+      // graph.)
+      const std::size_t m = poly.size() / 2;
+      const Point_2 mid((poly[m - 1].x() + poly[m].x()) / 2,
+                        (poly[m - 1].y() + poly[m].y()) / 2);
+      if (!inside_fill(mid.x(), mid.y(), fillRings_)) continue;
+      // Drop the degenerate incident bisector between a polygon/wall vertex and
+      // one of its own incident edges (perpendicular touching the boundary at a
+      // single point — not part of the skeleton).
+      if (isIncident(va, vb)) continue;
+
+      // Orient the polyline front->back as from-node->to-node.
+      int from = i1->second, to = i2->second;
+      if (sqdist(poly.front(), nodePos_[i1->second]) >
+          sqdist(poly.front(), nodePos_[i2->second])) {
+        from = i2->second;
+        to = i1->second;
+      }
+      const int id = static_cast<int>(medialEdges_.size());
+      const double w = polyline_len(poly);
+      medialEdges_.push_back({from, to, w, poly});
+      adj_[from].push_back({to, w, id, false, -1});
+      adj_[to].push_back({from, w, id, true, -1});
+      edgeLookup_[edge_key(sdg_, e)] = id;
+    }
+    dirty_ = false;
+  }
+
+  // True when one site is a point that is an endpoint of the other (a segment),
+  // i.e. an incident bisector — exactly the JS isIncidentBisector() test, but
+  // done with the sites' geometry directly (endpoints are shared exactly).
+  bool isIncident(Vertex_handle va, Vertex_handle vb) const {
+    if (sdg_.is_infinite(va) || sdg_.is_infinite(vb)) return false;
+    auto test = [](const Site_2& pt, const Site_2& sg) -> bool {
+      if (!pt.is_point() || !sg.is_segment()) return false;
+      const Point_2 p = pt.point();
+      return p == sg.source() || p == sg.target();
+    };
+    const Site_2 sa = va->site(), sb = vb->site();
+    return test(sa, sb) || test(sb, sa);
+  }
+
+  // True when the straight connector a->b properly crosses any wall. Such a
+  // connector would attach the point to the wall's far side (a different
+  // medial-graph component when the wall separates the axis), so attachment
+  // must avoid it. Endpoint touching is allowed (routing around a wall tip).
+  bool connectorHitsWall(const Point_2& a, const Point_2& b) const {
+    for (const auto& w : walls_)
+      if (segments_properly_cross(a, b, w.first, w.second)) return true;
+    return false;
+  }
+
+  // Add a bidirectional temporary edge between nodes u and v, with the polyline
+  // uv oriented u->v (the v->u direction stores the reverse).
+  void addTemp(std::vector<std::vector<Adj>>& g, std::vector<std::vector<Point_2>>& tempPolys,
+               int u, int v, const std::vector<Point_2>& uv, double L) {
+    const int k1 = static_cast<int>(tempPolys.size());
+    tempPolys.push_back(uv);
+    std::vector<Point_2> vu(uv.rbegin(), uv.rend());
+    const int k2 = static_cast<int>(tempPolys.size());
+    tempPolys.push_back(std::move(vu));
+    g[u].push_back({v, L, -1, false, k1});
+    g[v].push_back({u, L, -1, false, k2});
+  }
+
+  // Build the sub-arc of `poly` between two projections a and b (in either
+  // order along the polyline), oriented from a.q to b.q.
+  void buildArc(const std::vector<Point_2>& poly, const Proj& a, const Proj& b,
+                std::vector<Point_2>& out) {
+    if (a.seg <= b.seg) {
+      out.push_back(a.q);
+      for (int i = a.seg + 1; i <= b.seg; ++i) out.push_back(poly[i]);
+      out.push_back(b.q);
+    } else {
+      out.push_back(a.q);
+      for (int i = a.seg; i >= b.seg + 1; --i) out.push_back(poly[i]);
+      out.push_back(b.q);
+    }
+  }
+
+  // Attach a point to the medial graph: find the Voronoi cell containing it
+  // (its nearest site), project onto the nearest medial edge bounding that cell,
+  // split that edge at the projection, and connect the point with a straight
+  // connector. Returns the point's node id; sets qNode to the projection node id
+  // (-1 if there is no medial edge to attach to) and chosenEdge to the split
+  // medial edge id.
+  int connectPoint(double x, double y, std::vector<std::vector<Adj>>& g,
+                   std::vector<std::vector<Point_2>>& tempPolys, int& chosenEdge, int& qNode) {
+    // Among the medial features bounding the containing cell, attach to the
+    // nearest *interior* one — an edge whose endpoints are not polygon corners,
+    // or an interior Voronoi vertex (a branch point). Preferring interior
+    // features makes the connector jump straight to the skeleton's spine rather
+    // than to a short boundary stub near a corner. Considering vertices as well
+    // as edges also handles a convex region, whose every edge touches the
+    // boundary but whose central branch vertex is interior — we jump to it.
+    // A nearest edge of any kind is kept as a last resort, for the rare cell
+    // whose every bounding edge runs corner-to-corner (no interior vertex).
+    const double INF = std::numeric_limits<double>::infinity();
+    int bestAnyEdge = -1;
+    Proj bestAnyProj{INF, Point_2(x, y), 0};
+    int bestIntEdge = -1;
+    Proj bestIntProj{INF, Point_2(x, y), 0};
+    int bestIntVert = -1;
+    double bestIntVertD2 = INF;
+    // Last-resort fallback that ignores wall crossings, used only if every
+    // candidate connector would cross a wall (keeps behaviour no worse than
+    // before the crossing filter existed).
+    int fbEdge = -1;
+    Proj fbProj{INF, Point_2(x, y), 0};
+    const Point_2 p(x, y);
+
+    // A connector that properly crosses a wall would attach the point to the
+    // wall's far side — a different medial-graph component when the wall splits
+    // the axis, which is exactly the "no path even though it isn't blocked"
+    // bug. So a candidate is only eligible if its connector clears every wall.
+    auto consider = [&](int id) {
+      const MEdge& me = medialEdges_[id];
+      const Proj pr = project_polyline(x, y, me.poly);
+      if (pr.d2 < fbProj.d2) { fbProj = pr; fbEdge = id; }
+      if (connectorHitsWall(p, pr.q)) return;  // ineligible: crosses a wall
+      if (pr.d2 < bestAnyProj.d2) { bestAnyProj = pr; bestAnyEdge = id; }
+      if (!onBoundary_[me.from] && !onBoundary_[me.to] && pr.d2 < bestIntProj.d2) {
+        bestIntProj = pr;
+        bestIntEdge = id;
+      }
+      for (int n : {me.from, me.to}) {
+        if (!onBoundary_[n]) {
+          const double d2 = sqdist(p, nodePos_[n]);
+          if (d2 < bestIntVertD2 && !connectorHitsWall(p, nodePos_[n])) {
+            bestIntVertD2 = d2;
+            bestIntVert = n;
+          }
+        }
+      }
+    };
+
+    // Medial edges bounding the cell that contains the point. Considering one
+    // cell keeps the connector local: for a polygon-edge cell it stays inside
+    // the region. But a *wall's* cell straddles both sides of the wall (a wall
+    // is a barrier with walkable space on each side), so its bounding features
+    // live on both sides — and the connector to a far-side feature crosses the
+    // wall. The connectorHitsWall filter in consider() rejects exactly those,
+    // so attachment stays on the point's own side. When p lies on a Voronoi
+    // edge or vertex, that feature is found at distance ~0 regardless of the
+    // tie-break, and its connector (length ~0) crosses nothing.
+    if (sdg_.number_of_vertices() > 0) {
+      Vertex_handle nv = sdg_.nearest_neighbor(p);
+      if (nv != Vertex_handle() && !sdg_.is_infinite(nv)) {
+        Edge_circulator ec = sdg_.incident_edges(nv), done = ec;
+        if (ec != nullptr) {
+          do {
+            auto it = edgeLookup_.find(edge_key(sdg_, *ec));
+            if (it != edgeLookup_.end()) consider(it->second);
+          } while (++ec != done);
+        }
+      }
+    }
+    // Fallback: scan every medial edge (the point's cell touches none, its only
+    // features crossed a wall, or the point is outside the region).
+    if (bestAnyEdge < 0) {
+      for (std::size_t id = 0; id < medialEdges_.size(); ++id) consider(static_cast<int>(id));
+    }
+    // Last resort: no wall-clear feature exists anywhere (degenerate); attach to
+    // the nearest edge regardless of walls rather than fail to attach at all.
+    if (bestAnyEdge < 0 && bestIntVert < 0 && fbEdge >= 0) {
+      bestAnyEdge = fbEdge;
+      bestAnyProj = fbProj;
+    }
+
+    const int P = static_cast<int>(g.size());
+    g.push_back({});
+
+    // Attach to the closest interior feature (vertex vs. edge projection), and
+    // only fall back to the nearest boundary edge when there is no interior one.
+    const bool haveInterior = bestIntEdge >= 0 || bestIntVert >= 0;
+    const bool useVertex = bestIntVert >= 0 &&
+                           (bestIntEdge < 0 || bestIntVertD2 <= bestIntProj.d2);
+
+    if (useVertex) {
+      // Jump straight to the interior vertex — an existing graph node, so no
+      // edge split is needed; just add the straight connector to it.
+      std::vector<Point_2> pv = {p, nodePos_[bestIntVert]};
+      addTemp(g, tempPolys, P, bestIntVert, pv, std::sqrt(bestIntVertD2));
+      chosenEdge = -1;
+      qNode = bestIntVert;
+      return P;
+    }
+
+    const int best = haveInterior ? bestIntEdge : bestAnyEdge;
+    const Proj bestProj = haveInterior ? bestIntProj : bestAnyProj;
+    if (best < 0) { chosenEdge = -1; qNode = -1; return P; }
+
+    const MEdge& me = medialEdges_[best];
+    const std::vector<Point_2>& poly = me.poly;
+    const int seg = bestProj.seg;
+    const Point_2 q = bestProj.q;
+
+    // Sub-polylines: from-node..q and q..to-node.
+    std::vector<Point_2> aPoly;
+    for (int i = 0; i <= seg; ++i) aPoly.push_back(poly[i]);
+    aPoly.push_back(q);
+    std::vector<Point_2> bPoly;
+    bPoly.push_back(q);
+    for (std::size_t i = seg + 1; i < poly.size(); ++i) bPoly.push_back(poly[i]);
+
+    const int Q = static_cast<int>(g.size());
+    g.push_back({});
+
+    // Straight connector P->Q, and the split edges Q->from and Q->to.
+    std::vector<Point_2> pq = {p, q};
+    addTemp(g, tempPolys, P, Q, pq, std::sqrt(bestProj.d2));
+    std::vector<Point_2> qa(aPoly.rbegin(), aPoly.rend());  // q -> from
+    addTemp(g, tempPolys, Q, me.from, qa, polyline_len(aPoly));
+    addTemp(g, tempPolys, Q, me.to, bPoly, polyline_len(bPoly));  // q -> to
+
+    chosenEdge = best;
+    qNode = Q;
+    return P;
+  }
+
+  PF_SDG sdg_;
+  std::vector<std::vector<Point_2>> fillRings_;
+  std::set<Point_2, PointLess> boundaryVerts_;  // polygon corners + wall endpoints
+  std::vector<std::pair<Point_2, Point_2>> walls_;  // wall segments (for connector tests)
+  bool dirty_;
+
+  // Cached medial-axis graph (valid while !dirty_).
+  std::vector<Point_2> nodePos_;
+  std::vector<char> onBoundary_;  // per node: does it coincide with a polygon corner?
+  std::vector<MEdge> medialEdges_;
+  std::vector<std::vector<Adj>> adj_;
+  std::map<Face_handle, int> faceNode_;
+  std::unordered_map<std::pair<const void*, const void*>, int, EdgeKeyHash> edgeLookup_;
+};
+
 } // namespace
 
 EMSCRIPTEN_BINDINGS(voron8) {
   emscripten::function("computeVoronoi", &compute_voronoi);
   emscripten::function("computeVoronoiNoIntersections", &compute_voronoi_no_intersections);
+
+  emscripten::class_<MedialPathFinder>("MedialPathFinder")
+      .constructor<emscripten::val, emscripten::val>()
+      .function("addWall", &MedialPathFinder::addWall)
+      .function("findPath", &MedialPathFinder::findPath);
 }

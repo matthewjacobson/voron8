@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>voron8 — medial-axis path finder</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+      header { padding: 12px 16px; border-bottom: 1px solid #232733; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+      header h1 { margin: 0; font-size: 16px; }
+      a { color: #60a5fa; }
+      select, button { background: #1a1e27; color: #e6e6e6; border: 1px solid #343a48; border-radius: 6px; padding: 5px 8px; font: inherit; cursor: pointer; }
+      button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+      label { color: #9aa4b2; display: inline-flex; gap: 6px; align-items: center; }
+      .legend { color: #9aa4b2; display: flex; gap: 14px; flex-wrap: wrap; }
+      .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; }
+      .status { color: #9aa4b2; margin-left: auto; }
+      canvas { display: block; width: 100%; height: calc(100vh - 58px); cursor: crosshair; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>voron8 — path finder</h1>
+      <label>polygon <select id="pick"></select></label>
+      <button id="modeDrag" class="active" title="Drag the green start and red end handles">drag endpoints</button>
+      <button id="modeWall" title="Click two boundary points to add a wall the path may not cross">add wall</button>
+      <button id="clear" title="Remove all walls">clear walls</button>
+      <label><input type="checkbox" id="overlay" checked /> medial axis</label>
+      <div class="legend">
+        <span><span class="swatch" style="background:#3b82f6"></span>polygon</span>
+        <span><span class="swatch" style="background:#22c55e"></span>medial axis</span>
+        <span><span class="swatch" style="background:#f97316"></span>wall</span>
+        <span><span class="swatch" style="background:#facc15"></span>path</span>
+      </div>
+      <span class="status" id="status"></span>
+      <a href="./medial-axis.html">Medial-axis demo →</a>
+    </header>
+    <canvas id="c"></canvas>
+
+    <script type="module">
+      // Built bundle (run `npm run build`, then serve the repo and open /example/pathfinder.html).
+      import { init, voronoi, tessellate, MedialAxisPathFinder } from "../dist/voron8.js";
+
+      // Polygons from LingDong-/interesting-polygon-archive (JSON: a 3D array of
+      // contours -> vertices -> [x, y]; contour 0 is the outer ring, the rest
+      // are holes — exactly voron8's polygon input shape).
+      const ARCHIVE =
+        "https://raw.githubusercontent.com/LingDong-/interesting-polygon-archive/master/json/";
+      const NAMES = [
+        "skimage-horse", "matisse-icarus", "matisse-alga", "matisse-blue",
+        "matisse-nuit", "misc-discobolus", "misc-fu", "mapbox-dude",
+        "mapbox-building", "gray-embroidery", "held-1", "held-3",
+        "held-12", "eberly-10", "eberly-14", "elgindy-1", "mei-2", "mei-3",
+        "mei-5", "meisters-3", "seidel-3", "toussaint-1a",
+      ];
+
+      const pick = document.getElementById("pick");
+      const statusEl = document.getElementById("status");
+      const overlayToggle = document.getElementById("overlay");
+      const btnDrag = document.getElementById("modeDrag");
+      const btnWall = document.getElementById("modeWall");
+      const btnClear = document.getElementById("clear");
+      for (const n of NAMES) {
+        const o = document.createElement("option");
+        o.value = o.textContent = n;
+        pick.appendChild(o);
+      }
+
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d");
+
+      // The interior medial axis with walls accounted for: interior Voronoi edges
+      // minus the degenerate incident bisectors (a point site that is an endpoint
+      // of the segment site it bisects). This mirrors the library's medialAxis(),
+      // extended to include the wall segments — the same graph the finder routes on.
+      const sameVertex = (a, b) => a && b && a.input === b.input && a.vertex === b.vertex;
+      function isIncident(edge) {
+        const inc = (pt, seg) =>
+          pt.type === "point" && seg.type === "segment" && seg.segment &&
+          (sameVertex(pt.source, seg.segment[0]) || sameVertex(pt.source, seg.segment[1]));
+        const [a, b] = edge.sites;
+        return inc(a, b) || inc(b, a);
+      }
+
+      let state = null; // { polygons, bbox, finder, walls, start, end, overlay, path, boundaryVerts }
+      let proj = null;   // { fwd(x,y)->{x,y}, inv(sx,sy)->{x,y}, scale, ox, oy }
+
+      // Interaction state.
+      let mode = "drag";       // "drag" | "wall"
+      let dragTarget = null;   // "start" | "end"
+      let wallPending = null;  // first (snapped) boundary vertex of a wall being placed
+      let mouseWorld = null;   // last cursor position in world space (rubber band)
+      let wallSnap = null;     // boundary vertex the cursor currently snaps to (wall mode)
+
+      function bboxOf(polygons) {
+        let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+        for (const ring of polygons)
+          for (const [x, y] of ring) {
+            if (x < minx) minx = x; if (x > maxx) maxx = x;
+            if (y < miny) miny = y; if (y > maxy) maxy = y;
+          }
+        return { minx, miny, maxx, maxy };
+      }
+
+      async function loadPolygon(name) {
+        statusEl.textContent = `loading ${name}…`;
+        const res = await fetch(ARCHIVE + name + ".json");
+        if (!res.ok) throw new Error(`fetch failed (${res.status})`);
+        const polygons = await res.json();
+
+        if (state?.finder) state.finder.dispose();
+        const finder = new MedialAxisPathFinder(polygons);
+        // Every ring vertex is an "actual point on the boundary" — the only
+        // places a wall may be anchored.
+        const boundaryVerts = polygons.flatMap((ring) => ring.map(([x, y]) => ({ x, y })));
+        state = { polygons, bbox: bboxOf(polygons), finder, walls: [], start: null, end: null, overlay: [], path: null, boundaryVerts };
+
+        computeOverlay();
+        // Default the endpoints to the extreme points of the medial axis, which are
+        // guaranteed interior and on the skeleton, so a path shows immediately.
+        const pts = state.overlay.flat();
+        if (pts.length) {
+          let a = pts[0], b = pts[0];
+          for (const p of pts) { if (p.x < a.x) a = p; if (p.x > b.x) b = p; }
+          state.start = { x: a.x, y: a.y };
+          state.end = { x: b.x, y: b.y };
+        } else {
+          const { minx, miny, maxx, maxy } = state.bbox;
+          state.start = { x: minx + (maxx - minx) * 0.25, y: (miny + maxy) / 2 };
+          state.end = { x: minx + (maxx - minx) * 0.75, y: (miny + maxy) / 2 };
+        }
+        wallPending = null;
+        recomputePath();
+        resize();
+      }
+
+      function computeOverlay() {
+        const segments = state.walls.map((w) => [[w[0], w[1]], [w[2], w[3]]]);
+        const res = voronoi({ polygons: state.polygons, segments });
+        state.overlay = res.edges
+          .filter((e) => e.location === "interior" && !isIncident(e))
+          .map((e) => tessellate(e.geometry, { parabolaSamples: 20 }));
+      }
+
+      function recomputePath() {
+        if (!state?.start || !state?.end) return;
+        state.path = state.finder.findPath(state.start, state.end);
+        const nWalls = state.walls.length;
+        const p = state.path;
+        statusEl.textContent = p.found
+          ? `${pick.value}: path found · length ${p.length.toFixed(1)} · ${nWalls} wall${nWalls === 1 ? "" : "s"}`
+          : `${pick.value}: no path (blocked by a wall) · ${nWalls} wall${nWalls === 1 ? "" : "s"}`;
+      }
+
+      function addWall(a, b) {
+        state.walls.push([a.x, a.y, b.x, b.y]);
+        state.finder.addWall(a, b);
+        computeOverlay();   // reflect the wall in the medial-axis overlay
+        recomputePath();
+        draw();
+      }
+
+      // Fit the polygon bounding box into the canvas (image coords are Y-down,
+      // matching canvas, so no flip). Also expose the inverse for hit-testing.
+      function makeProjector() {
+        const { minx, miny, maxx, maxy } = state.bbox;
+        const pad = 32;
+        const w = canvas.clientWidth, h = canvas.clientHeight;
+        const scale = Math.min((w - 2 * pad) / (maxx - minx || 1), (h - 2 * pad) / (maxy - miny || 1));
+        const ox = (w - (maxx - minx) * scale) / 2;
+        const oy = (h - (maxy - miny) * scale) / 2;
+        return {
+          scale, ox, oy,
+          fwd: (x, y) => ({ x: ox + (x - minx) * scale, y: oy + (y - miny) * scale }),
+          inv: (sx, sy) => ({ x: minx + (sx - ox) / scale, y: miny + (sy - oy) / scale }),
+        };
+      }
+
+      function strokePolyline(pts, color, width) {
+        if (pts.length < 2) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        const p0 = proj.fwd(pts[0].x, pts[0].y);
+        ctx.moveTo(p0.x, p0.y);
+        for (let i = 1; i < pts.length; i++) {
+          const p = proj.fwd(pts[i].x, pts[i].y);
+          ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+      }
+
+      function dot(world, color, r) {
+        const p = proj.fwd(world.x, world.y);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#0f1115";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+        if (!state) return;
+
+        // Filled polygon (even-odd so holes punch through).
+        ctx.beginPath();
+        for (const ring of state.polygons) {
+          ring.forEach(([x, y], i) => {
+            const p = proj.fwd(x, y);
+            i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y);
+          });
+          ctx.closePath();
+        }
+        ctx.fillStyle = "rgba(59,130,246,0.10)";
+        ctx.fill("evenodd");
+        ctx.strokeStyle = "#3b82f6";
+        ctx.lineWidth = 1.25;
+        ctx.stroke();
+
+        // Medial-axis overlay (accounts for walls).
+        if (overlayToggle.checked) {
+          for (const pl of state.overlay) strokePolyline(pl, "#22c55e", 1.25);
+        }
+
+        // In wall mode, mark the boundary vertices a wall can anchor to, and
+        // highlight the one the cursor currently snaps to.
+        if (mode === "wall") {
+          for (const v of state.boundaryVerts) {
+            const p = proj.fwd(v.x, v.y);
+            ctx.fillStyle = "rgba(249,115,22,0.55)";
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          if (wallSnap) dot(wallSnap, "#fdba74", 5);
+        }
+
+        // Walls.
+        for (const w of state.walls) {
+          strokePolyline([{ x: w[0], y: w[1] }, { x: w[2], y: w[3] }], "#f97316", 3);
+          dot({ x: w[0], y: w[1] }, "#f97316", 3);
+          dot({ x: w[2], y: w[3] }, "#f97316", 3);
+        }
+
+        // Wall being placed (rubber band, snapped end to the nearest vertex).
+        if (mode === "wall" && wallPending) {
+          const end = wallSnap || mouseWorld;
+          if (end) {
+            ctx.setLineDash([6, 5]);
+            strokePolyline([wallPending, end], "#f97316", 2);
+            ctx.setLineDash([]);
+          }
+          dot(wallPending, "#f97316", 4);
+        }
+
+        // The found path.
+        if (state.path?.found) strokePolyline(state.path.path, "#facc15", 3);
+
+        // Draggable endpoints.
+        if (state.start) dot(state.start, "#22c55e", 7);
+        if (state.end) dot(state.end, "#ef4444", 7);
+      }
+
+      function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * dpr;
+        canvas.height = canvas.clientHeight * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        if (state) proj = makeProjector();
+        draw();
+      }
+
+      // --- interaction ---------------------------------------------------------
+
+      function eventWorld(e) {
+        const rect = canvas.getBoundingClientRect();
+        return proj.inv(e.clientX - rect.left, e.clientY - rect.top);
+      }
+
+      // Snap a world-space point to the nearest boundary vertex — walls may only
+      // be anchored at actual points on the polygon boundary.
+      function nearestBoundaryVertex(world) {
+        let best = null, bd = Infinity;
+        for (const v of state.boundaryVerts) {
+          const d = (v.x - world.x) ** 2 + (v.y - world.y) ** 2;
+          if (d < bd) { bd = d; best = v; }
+        }
+        return best;
+      }
+
+      function nearHandle(e) {
+        const rect = canvas.getBoundingClientRect();
+        const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+        for (const key of ["start", "end"]) {
+          const h = proj.fwd(state[key].x, state[key].y);
+          if (Math.hypot(sx - h.x, sy - h.y) <= 12) return key;
+        }
+        return null;
+      }
+
+      function setMode(m) {
+        mode = m;
+        wallPending = null;
+        wallSnap = null;
+        btnDrag.classList.toggle("active", m === "drag");
+        btnWall.classList.toggle("active", m === "wall");
+        canvas.style.cursor = m === "wall" ? "crosshair" : "default";
+        draw();
+      }
+
+      canvas.addEventListener("mousedown", (e) => {
+        if (!state) return;
+        if (mode === "wall") {
+          const w = nearestBoundaryVertex(eventWorld(e));
+          if (!w) return;
+          if (!wallPending) {
+            wallPending = w;
+          } else {
+            // Ignore a degenerate wall (both clicks on the same vertex).
+            if (w.x !== wallPending.x || w.y !== wallPending.y) addWall(wallPending, w);
+            wallPending = null;
+          }
+          draw();
+          return;
+        }
+        dragTarget = nearHandle(e);
+      });
+
+      canvas.addEventListener("mousemove", (e) => {
+        if (!state) return;
+        mouseWorld = eventWorld(e);
+        if (dragTarget) {
+          state[dragTarget] = mouseWorld;
+          recomputePath();
+          draw();
+        } else if (mode === "wall") {
+          wallSnap = nearestBoundaryVertex(mouseWorld);
+          draw();
+        }
+      });
+
+      window.addEventListener("mouseup", () => { dragTarget = null; });
+
+      overlayToggle.addEventListener("change", draw);
+      btnDrag.addEventListener("click", () => setMode("drag"));
+      btnWall.addEventListener("click", () => setMode("wall"));
+      btnClear.addEventListener("click", () => {
+        if (!state) return;
+        state.finder.dispose();
+        state.finder = new MedialAxisPathFinder(state.polygons);
+        state.walls = [];
+        wallPending = null;
+        computeOverlay();
+        recomputePath();
+        draw();
+      });
+
+      window.addEventListener("resize", resize);
+      pick.addEventListener("change", () =>
+        loadPolygon(pick.value).catch((err) => (statusEl.textContent = "error: " + err.message)),
+      );
+
+      init()
+        .then(() => loadPolygon(pick.value))
+        .catch((err) => (statusEl.textContent = "error: " + err.message));
+    </script>
+  </body>
+</html>

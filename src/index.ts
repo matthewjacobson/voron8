@@ -223,6 +223,16 @@ type RawResult = {
   groups: Array<{ label: number; rings: Array<{ unbounded: boolean; boundary: number[] }> }>;
 };
 
+/** The embind handle for the C++ incremental path finder (see MedialAxisPathFinder). */
+type WasmPathFinder = {
+  addWall: (x1: number, y1: number, x2: number, y2: number) => void;
+  findPath: (
+    sx: number, sy: number, ex: number, ey: number,
+  ) => { found: boolean; path: Point[]; length: number };
+  /** Free the underlying C++ object (embind requires manual deletion). */
+  delete: () => void;
+};
+
 type WasmModule = {
   computeVoronoi: (
     coords: number[], ringSizes: number[], closed: number[], labels: number[],
@@ -231,6 +241,8 @@ type WasmModule = {
   computeVoronoiNoIntersections: (
     coords: number[], ringSizes: number[], closed: number[], labels: number[],
   ) => RawResult;
+  /** Constructor for the stateful C++ path finder (polygon coords + ring sizes). */
+  MedialPathFinder: new (coords: number[], ringSizes: number[]) => WasmPathFinder;
 };
 
 let modulePromise: Promise<WasmModule> | null = null;
@@ -676,6 +688,109 @@ export function componentAdjacency(
   }
 
   return { componentCount, vertexComponent, adjacency, pairs };
+}
+
+/** A path found by {@link MedialAxisPathFinder.findPath}. */
+export interface MedialPath {
+  /** True when a route exists; false when start and end are separated (e.g. by a wall or hole). */
+  found: boolean;
+  /**
+   * The path as a polyline from the start point to the end point, following the
+   * medial axis (parabolic arcs are sampled into short segments). Empty when
+   * `found` is false.
+   */
+  path: Point[];
+  /** Total path length, or 0 when `found` is false. */
+  length: number;
+}
+
+/**
+ * An incremental medial-axis path finder for a polygon with holes.
+ *
+ * Construct it from the polygon rings (outer boundary plus holes). Then add
+ * *walls* — internal segments the path may not cross — one at a time with
+ * {@link addWall}; each wall is inserted into the live segment Delaunay graph in
+ * place (the diagram is not rebuilt from scratch). {@link findPath} routes
+ * between two arbitrary points along the interior medial axis of the current
+ * region: the axis stays maximally far from every boundary and wall, and — since
+ * walls are Voronoi sites the axis never crosses — a wall fully partitioning the
+ * region makes the two sides unreachable (`found: false`).
+ *
+ * Each endpoint is attached to the axis by finding the Voronoi cell that
+ * contains it and projecting onto the nearest medial edge bounding that cell,
+ * with a straight connector. The whole finder (graph extraction, endpoint
+ * attachment, and the Dijkstra search) runs in C++/WASM, so adding a wall or
+ * querying a path never marshals the full diagram across the JS boundary — only
+ * the resulting polyline is returned.
+ *
+ * The derived medial graph is cached and only recomputed after a wall has been
+ * added, so repeated {@link findPath} calls between wall insertions are cheap.
+ *
+ * Synchronous: await {@link init} once before constructing (it throws otherwise).
+ * Call {@link dispose} when finished to free the underlying C++ object.
+ *
+ * @example
+ * await init();
+ * const finder = new MedialAxisPathFinder([outerRing, holeRing]);
+ * finder.addWall([10, 0], [10, 50]);
+ * const { found, path } = finder.findPath({ x: 2, y: 2 }, { x: 90, y: 90 });
+ * finder.dispose();
+ */
+export class MedialAxisPathFinder {
+  private handle: WasmPathFinder | null;
+
+  /**
+   * @param polygon The region's rings (each closed; the last vertex connects to
+   *                the first). Ring 0 is the outer boundary; nested rings are
+   *                holes under the even-odd fill rule.
+   */
+  constructor(polygon: Polygon[]) {
+    const mod = getModule();
+    const coords: number[] = [];
+    const ringSizes: number[] = [];
+    for (const ring of polygon) {
+      const r = toRing(ring);
+      for (const [x, y] of r) coords.push(x, y);
+      ringSizes.push(r.length);
+    }
+    this.handle = new mod.MedialPathFinder(coords, ringSizes);
+  }
+
+  /**
+   * Add a wall — a segment the path may not cross — to the diagram. Incremental:
+   * the underlying Delaunay graph is updated in place, and the derived medial
+   * graph is recomputed lazily on the next {@link findPath}.
+   */
+  addWall(a: Point | [number, number], b: Point | [number, number]): void {
+    const [ax, ay] = toXY(a);
+    const [bx, by] = toXY(b);
+    this.active().addWall(ax, ay, bx, by);
+  }
+
+  /**
+   * Route from `start` to `end` along the medial axis of the current region.
+   */
+  findPath(start: Point | [number, number], end: Point | [number, number]): MedialPath {
+    const [sx, sy] = toXY(start);
+    const [ex, ey] = toXY(end);
+    const r = this.active().findPath(sx, sy, ex, ey);
+    return { found: r.found, path: r.path, length: r.length };
+  }
+
+  /** Free the underlying C++ object. The finder must not be used afterward. */
+  dispose(): void {
+    if (this.handle) {
+      this.handle.delete();
+      this.handle = null;
+    }
+  }
+
+  private active(): WasmPathFinder {
+    if (!this.handle) {
+      throw new Error("voron8: this MedialAxisPathFinder has been disposed.");
+    }
+    return this.handle;
+  }
 }
 
 export interface TessellateOptions {
