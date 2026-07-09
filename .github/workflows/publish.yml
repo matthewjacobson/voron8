@@ -27,7 +27,10 @@ jobs:
           node-version: 22
 
       # ...and npm >= 11.5.1, which is newer than the runner's bundled npm.
-      - run: npm install -g npm@latest
+      # Pinned to the npm 11 line: npm@latest bit us when 12.0.0 shipped with a
+      # broken libnpmpublish (missing its sigstore module), failing `npm
+      # publish` outright. Bump deliberately once a 12.x is known-good.
+      - run: npm install -g npm@11
 
       - run: npm ci
 
