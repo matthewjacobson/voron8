@@ -656,6 +656,7 @@ class MedialPathFinder {
   typedef PF_SDG::Vertex_handle  Vertex_handle;
   typedef PF_SDG::Edge           Edge;
   typedef PF_SDG::Edge_circulator Edge_circulator;
+  typedef PF_SDG::Vertex_circulator Vertex_circulator;
   typedef PF_SDG::Site_2         Site_2;
 
   // coords/ringSizes describe the polygon exactly like computeVoronoi's inputs,
@@ -720,27 +721,27 @@ class MedialPathFinder {
     std::vector<std::vector<Adj>> g = adj_;
     std::vector<std::vector<Point_2>> tempPolys;
 
-    int chosenS = -1, qS = -1, chosenE = -1, qE = -1;
-    const int S = connectPoint(sx, sy, g, tempPolys, chosenS, qS);
-    const int T = connectPoint(ex, ey, g, tempPolys, chosenE, qE);
+    std::map<int, EdgeAttach> attachS, attachE;
+    bool okS = false, okE = false;
+    const int S = connectPoint(sx, sy, g, tempPolys, attachS, okS);
+    const int T = connectPoint(ex, ey, g, tempPolys, attachE, okE);
 
-    if (qS < 0 || qE < 0) {  // no medial axis to attach to
+    if (!okS || !okE) {  // no medial axis to attach to
       result.set("found", false);
       result.set("path", path);
       result.set("length", 0.0);
       return result;
     }
 
-    // If both endpoints project onto the *same* medial edge, join their two
+    // Wherever both endpoints split the *same* medial edge, join their two
     // projection nodes directly by the sub-arc between them, so a short hop does
     // not detour out to a shared edge endpoint.
-    if (chosenS >= 0 && chosenS == chosenE && qS != qE) {
-      const std::vector<Point_2>& poly = medialEdges_[chosenS].poly;
-      Proj a = project_polyline(sx, sy, poly);
-      Proj b = project_polyline(ex, ey, poly);
+    for (const auto& [id, sa] : attachS) {
+      auto it = attachE.find(id);
+      if (it == attachE.end()) continue;
       std::vector<Point_2> arc;
-      buildArc(poly, a, b, arc);
-      addTemp(g, tempPolys, qS, qE, arc, polyline_len(arc));
+      buildArc(medialEdges_[id].poly, sa.proj, it->second.proj, arc);
+      addTemp(g, tempPolys, sa.q, it->second.q, arc, polyline_len(arc));
     }
 
     // Dijkstra from S to T over g.
@@ -959,143 +960,193 @@ class MedialPathFinder {
     }
   }
 
-  // Attach a point to the medial graph: find the Voronoi cell containing it
-  // (its nearest site), project onto the nearest medial edge bounding that cell,
-  // split that edge at the projection, and connect the point with a straight
-  // connector. Returns the point's node id; sets qNode to the projection node id
-  // (-1 if there is no medial edge to attach to) and chosenEdge to the split
-  // medial edge id.
+  // One endpoint attachment onto a split medial edge: the projection node id in
+  // the working graph plus the projection itself (kept so findPath can join two
+  // endpoints that split the same edge by the sub-arc between them).
+  struct EdgeAttach { int q; Proj proj; };
+
+  // Euclidean distance from p to a site (point or segment). Used to detect
+  // nearest-site ties: when p lies exactly on a junction — a boundary reflex
+  // corner, a wall endpoint, a T-junction — several sites are at the same
+  // (often zero) distance and nearest_neighbor() breaks the tie arbitrarily.
+  static double siteDist(const Site_2& s, const Point_2& p) {
+    if (s.is_point()) return std::sqrt(sqdist(s.point(), p));
+    const Point_2 a = s.source(), b = s.target();
+    const double dx = b.x() - a.x(), dy = b.y() - a.y();
+    const double len2 = dx * dx + dy * dy;
+    double t = len2 > 0 ? ((p.x() - a.x()) * dx + (p.y() - a.y()) * dy) / len2 : 0;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    return std::sqrt(sqdist(Point_2(a.x() + t * dx, a.y() + t * dy), p));
+  }
+
+  // Attach a point to the medial graph. Finds every Voronoi cell whose closure
+  // contains the point — the nearest site's, plus every site tied with it — and
+  // adds a temporary connector to EVERY eligible medial feature bounding those
+  // cells; Dijkstra then makes the destination-aware choice among them.
+  //
+  // Both halves matter. Enumerating tied cells means a point exactly on a
+  // junction (a boundary reflex corner, a wall endpoint, a wall–boundary
+  // T-junction) sees the features on *all* its sides, not the arbitrary side
+  // nearest_neighbor()'s tie-break lands on — with walls, the arbitrary side
+  // can be the wrong component, a spurious "no path". And attaching to every
+  // eligible feature (rather than one nearest) matters because a single
+  // connector is destination-blind: at a skeleton branch two features tie for
+  // nearest, and committing to either detours every path headed the other way.
+  //
+  // The feature tiers are unchanged: interior features — edges whose endpoints
+  // are both off the boundary, plus interior branch vertices — are preferred,
+  // so connectors still jump to the skeleton's spine rather than a boundary
+  // stub near a corner; boundary edges are used only when no interior feature
+  // is eligible; and the wall-ignoring nearest edge stays the degenerate last
+  // resort. Within the winning tier, every candidate gets a connector.
+  //
+  // Returns the point's node id. `attached` reports whether any connector was
+  // added; `edgeAttach` maps each split medial edge id to its projection node.
   int connectPoint(double x, double y, std::vector<std::vector<Adj>>& g,
-                   std::vector<std::vector<Point_2>>& tempPolys, int& chosenEdge, int& qNode) {
-    // Among the medial features bounding the containing cell, attach to the
-    // nearest *interior* one — an edge whose endpoints are not polygon corners,
-    // or an interior Voronoi vertex (a branch point). Preferring interior
-    // features makes the connector jump straight to the skeleton's spine rather
-    // than to a short boundary stub near a corner. Considering vertices as well
-    // as edges also handles a convex region, whose every edge touches the
-    // boundary but whose central branch vertex is interior — we jump to it.
-    // A nearest edge of any kind is kept as a last resort, for the rare cell
-    // whose every bounding edge runs corner-to-corner (no interior vertex).
+                   std::vector<std::vector<Point_2>>& tempPolys,
+                   std::map<int, EdgeAttach>& edgeAttach, bool& attached) {
+    const Point_2 p(x, y);
     const double INF = std::numeric_limits<double>::infinity();
-    int bestAnyEdge = -1;
-    Proj bestAnyProj{INF, Point_2(x, y), 0};
-    int bestIntEdge = -1;
-    Proj bestIntProj{INF, Point_2(x, y), 0};
-    int bestIntVert = -1;
-    double bestIntVertD2 = INF;
+
+    // Candidate features, deduped across the (possibly several) cells scanned.
+    // std::map keeps iteration — and thus temp-node numbering — deterministic.
+    std::set<int> seen;
+    std::map<int, Proj> intEdges, anyEdges;  // medial edge id -> projection
+    std::map<int, double> intVerts;          // graph node id -> squared distance
     // Last-resort fallback that ignores wall crossings, used only if every
     // candidate connector would cross a wall (keeps behaviour no worse than
     // before the crossing filter existed).
     int fbEdge = -1;
-    Proj fbProj{INF, Point_2(x, y), 0};
-    const Point_2 p(x, y);
+    Proj fbProj{INF, p, 0};
 
     // A connector that properly crosses a wall would attach the point to the
     // wall's far side — a different medial-graph component when the wall splits
-    // the axis, which is exactly the "no path even though it isn't blocked"
-    // bug. So a candidate is only eligible if its connector clears every wall.
+    // the axis (a wall's cell straddles both of its sides, so its bounding
+    // features do too) — so such a candidate is ineligible.
     auto consider = [&](int id) {
+      if (!seen.insert(id).second) return;
       const MEdge& me = medialEdges_[id];
       const Proj pr = project_polyline(x, y, me.poly);
       if (pr.d2 < fbProj.d2) { fbProj = pr; fbEdge = id; }
-      if (connectorHitsWall(p, pr.q)) return;  // ineligible: crosses a wall
-      if (pr.d2 < bestAnyProj.d2) { bestAnyProj = pr; bestAnyEdge = id; }
-      if (!onBoundary_[me.from] && !onBoundary_[me.to] && pr.d2 < bestIntProj.d2) {
-        bestIntProj = pr;
-        bestIntEdge = id;
+      if (!connectorHitsWall(p, pr.q)) {
+        anyEdges.emplace(id, pr);
+        if (!onBoundary_[me.from] && !onBoundary_[me.to]) intEdges.emplace(id, pr);
       }
       for (int n : {me.from, me.to}) {
-        if (!onBoundary_[n]) {
+        if (!onBoundary_[n] && !intVerts.count(n)) {
           const double d2 = sqdist(p, nodePos_[n]);
-          if (d2 < bestIntVertD2 && !connectorHitsWall(p, nodePos_[n])) {
-            bestIntVertD2 = d2;
-            bestIntVert = n;
-          }
+          if (!connectorHitsWall(p, nodePos_[n])) intVerts.emplace(n, d2);
         }
       }
     };
 
-    // Medial edges bounding the cell that contains the point. Considering one
-    // cell keeps the connector local: for a polygon-edge cell it stays inside
-    // the region. But a *wall's* cell straddles both sides of the wall (a wall
-    // is a barrier with walkable space on each side), so its bounding features
-    // live on both sides — and the connector to a far-side feature crosses the
-    // wall. The connectorHitsWall filter in consider() rejects exactly those,
-    // so attachment stays on the point's own side. When p lies on a Voronoi
-    // edge or vertex, that feature is found at distance ~0 regardless of the
-    // tie-break, and its connector (length ~0) crosses nothing.
+    // The cells whose closure contains p: the nearest site's, plus — when p is
+    // equidistant from several sites (exactly on a junction) — every tied
+    // site's. The tied cells form a connected fan around p, so a BFS over
+    // Delaunay adjacency starting at the nearest site reaches them all.
     if (sdg_.number_of_vertices() > 0) {
       Vertex_handle nv = sdg_.nearest_neighbor(p);
       if (nv != Vertex_handle() && !sdg_.is_infinite(nv)) {
-        Edge_circulator ec = sdg_.incident_edges(nv), done = ec;
-        if (ec != nullptr) {
+        const double d0 = siteDist(nv->site(), p);
+        const double tieTol = 1e-9 * (1.0 + std::fabs(x) + std::fabs(y) + d0);
+        std::vector<Vertex_handle> cells{nv};
+        std::set<const void*> visited{&*nv};
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+          Vertex_circulator vc = sdg_.incident_vertices(cells[i]);
+          if (vc == nullptr) continue;
+          Vertex_circulator vdone = vc;
           do {
-            auto it = edgeLookup_.find(edge_key(sdg_, *ec));
-            if (it != edgeLookup_.end()) consider(it->second);
-          } while (++ec != done);
+            Vertex_handle w = vc;
+            if (!sdg_.is_infinite(w) && visited.insert(&*w).second &&
+                siteDist(w->site(), p) <= d0 + tieTol)
+              cells.push_back(w);
+          } while (++vc != vdone);
+        }
+        for (Vertex_handle v : cells) {
+          Edge_circulator ec = sdg_.incident_edges(v), edone = ec;
+          if (ec != nullptr) {
+            do {
+              auto it = edgeLookup_.find(edge_key(sdg_, *ec));
+              if (it != edgeLookup_.end()) consider(it->second);
+            } while (++ec != edone);
+          }
         }
       }
     }
-    // Fallback: scan every medial edge (the point's cell touches none, its only
-    // features crossed a wall, or the point is outside the region).
-    if (bestAnyEdge < 0) {
-      for (std::size_t id = 0; id < medialEdges_.size(); ++id) consider(static_cast<int>(id));
-    }
-    // Last resort: no wall-clear feature exists anywhere (degenerate); attach to
-    // the nearest edge regardless of walls rather than fail to attach at all.
-    if (bestAnyEdge < 0 && bestIntVert < 0 && fbEdge >= 0) {
-      bestAnyEdge = fbEdge;
-      bestAnyProj = fbProj;
+
+    // Fallback: the cells offered no wall-clear edge (they touch no kept medial
+    // edge, every connector crossed a wall, or the point is outside the
+    // region). Scan every medial edge, then reduce each tier to its single
+    // nearest candidate — the scan has no cell locality, and a global
+    // multi-attach would tie the point to features across the whole region
+    // through connectors only the wall test vets.
+    if (anyEdges.empty()) {
+      for (std::size_t id = 0; id < medialEdges_.size(); ++id)
+        consider(static_cast<int>(id));
+      auto reduceEdges = [](std::map<int, Proj>& m) {
+        if (m.size() <= 1) return;
+        auto best = m.begin();
+        for (auto it = m.begin(); it != m.end(); ++it)
+          if (it->second.d2 < best->second.d2) best = it;
+        std::map<int, Proj> one;
+        one.insert(*best);
+        m.swap(one);
+      };
+      reduceEdges(intEdges);
+      reduceEdges(anyEdges);
+      if (intVerts.size() > 1) {
+        auto best = intVerts.begin();
+        for (auto it = intVerts.begin(); it != intVerts.end(); ++it)
+          if (it->second < best->second) best = it;
+        std::map<int, double> one;
+        one.insert(*best);
+        intVerts.swap(one);
+      }
     }
 
     const int P = static_cast<int>(g.size());
     g.push_back({});
+    attached = false;
 
-    // Attach to the closest interior feature (vertex vs. edge projection), and
-    // only fall back to the nearest boundary edge when there is no interior one.
-    const bool haveInterior = bestIntEdge >= 0 || bestIntVert >= 0;
-    const bool useVertex = bestIntVert >= 0 &&
-                           (bestIntEdge < 0 || bestIntVertD2 <= bestIntProj.d2);
+    // Split a medial edge at the projection: node Q at q, straight connector
+    // P->Q, and the two half-arcs Q->from and Q->to.
+    auto splitAttach = [&](int id, const Proj& pr) {
+      const MEdge& me = medialEdges_[id];
+      const std::vector<Point_2>& poly = me.poly;
+      // Sub-polylines: from-node..q and q..to-node.
+      std::vector<Point_2> aPoly(poly.begin(), poly.begin() + pr.seg + 1);
+      aPoly.push_back(pr.q);
+      std::vector<Point_2> bPoly;
+      bPoly.push_back(pr.q);
+      for (std::size_t i = pr.seg + 1; i < poly.size(); ++i) bPoly.push_back(poly[i]);
 
-    if (useVertex) {
-      // Jump straight to the interior vertex — an existing graph node, so no
-      // edge split is needed; just add the straight connector to it.
-      std::vector<Point_2> pv = {p, nodePos_[bestIntVert]};
-      addTemp(g, tempPolys, P, bestIntVert, pv, std::sqrt(bestIntVertD2));
-      chosenEdge = -1;
-      qNode = bestIntVert;
-      return P;
+      const int Q = static_cast<int>(g.size());
+      g.push_back({});
+      std::vector<Point_2> pq = {p, pr.q};
+      addTemp(g, tempPolys, P, Q, pq, std::sqrt(pr.d2));
+      std::vector<Point_2> qa(aPoly.rbegin(), aPoly.rend());  // q -> from
+      addTemp(g, tempPolys, Q, me.from, qa, polyline_len(aPoly));
+      addTemp(g, tempPolys, Q, me.to, bPoly, polyline_len(bPoly));  // q -> to
+      edgeAttach.emplace(id, EdgeAttach{Q, pr});
+      attached = true;
+    };
+
+    // Attach to every feature in the best available tier. The extra connectors
+    // are a handful of temporary nodes per query — cheap — and give Dijkstra
+    // the per-destination choice a single nearest attachment cannot make.
+    if (!intEdges.empty() || !intVerts.empty()) {
+      for (const auto& [n, d2] : intVerts) {
+        std::vector<Point_2> pv = {p, nodePos_[n]};
+        addTemp(g, tempPolys, P, n, pv, std::sqrt(d2));
+        attached = true;
+      }
+      for (const auto& [id, pr] : intEdges) splitAttach(id, pr);
+    } else if (!anyEdges.empty()) {
+      for (const auto& [id, pr] : anyEdges) splitAttach(id, pr);
+    } else if (fbEdge >= 0) {
+      splitAttach(fbEdge, fbProj);
     }
-
-    const int best = haveInterior ? bestIntEdge : bestAnyEdge;
-    const Proj bestProj = haveInterior ? bestIntProj : bestAnyProj;
-    if (best < 0) { chosenEdge = -1; qNode = -1; return P; }
-
-    const MEdge& me = medialEdges_[best];
-    const std::vector<Point_2>& poly = me.poly;
-    const int seg = bestProj.seg;
-    const Point_2 q = bestProj.q;
-
-    // Sub-polylines: from-node..q and q..to-node.
-    std::vector<Point_2> aPoly;
-    for (int i = 0; i <= seg; ++i) aPoly.push_back(poly[i]);
-    aPoly.push_back(q);
-    std::vector<Point_2> bPoly;
-    bPoly.push_back(q);
-    for (std::size_t i = seg + 1; i < poly.size(); ++i) bPoly.push_back(poly[i]);
-
-    const int Q = static_cast<int>(g.size());
-    g.push_back({});
-
-    // Straight connector P->Q, and the split edges Q->from and Q->to.
-    std::vector<Point_2> pq = {p, q};
-    addTemp(g, tempPolys, P, Q, pq, std::sqrt(bestProj.d2));
-    std::vector<Point_2> qa(aPoly.rbegin(), aPoly.rend());  // q -> from
-    addTemp(g, tempPolys, Q, me.from, qa, polyline_len(aPoly));
-    addTemp(g, tempPolys, Q, me.to, bPoly, polyline_len(bPoly));  // q -> to
-
-    chosenEdge = best;
-    qNode = Q;
     return P;
   }
 

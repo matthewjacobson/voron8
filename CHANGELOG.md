@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1] - 2026-07-09
+
+### Fixed
+
+- `MedialAxisPathFinder`: endpoint attachment at junction points — a start or
+  end lying exactly on a boundary reflex vertex, a wall endpoint, or a
+  wall–boundary T-junction (and, more generally, any point where nearby medial
+  features tie for nearest). Attachment previously located a *single* Voronoi
+  cell via `nearest_neighbor()` — whose tie-break is arbitrary when the point
+  is equidistant from several sites, exactly the situation at a junction — and
+  committed to a *single* nearest connector, which is destination-blind: at a
+  skeleton branch two features tie for nearest, and picking one arbitrarily
+  detoured every path headed the other way (observed 92 vs the correct 35 on an
+  L-shape), or, with walls, attached to the wrong medial component and reported
+  a spurious `found: false` between plainly connected points. Attachment now
+  gathers every cell whose closure contains the point (the nearest site plus
+  all tied sites, found by BFS over Delaunay adjacency) and adds a temporary
+  connector to *every* eligible feature in the preferred tier, letting the
+  Dijkstra search make the destination-aware choice. The tier preferences
+  (interior spine over boundary stubs, wall-crossing connectors rejected) are
+  unchanged, and the global-scan fallback still attaches to the single nearest
+  feature only.
+
 ## [3.4.0] - 2026-07-07
 
 ### Added
@@ -203,6 +226,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   WebAssembly, with interior/exterior edge labeling, input-vertex provenance,
   `medialAxis()`, and `tessellate()`.
 
+[3.4.1]: https://github.com/matthewjacobson/voron8/compare/v3.4.0...v3.4.1
 [3.4.0]: https://github.com/matthewjacobson/voron8/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/matthewjacobson/voron8/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/matthewjacobson/voron8/compare/v3.1.1...v3.2.0

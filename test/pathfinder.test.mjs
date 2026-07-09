@@ -324,6 +324,104 @@ test("a wall's endpoints are boundary corners, so attachment skips their stubs",
   }
 });
 
+// --- endpoint attachment at junctions (reflex corners, wall junctions) -------
+//
+// An L-shape with its reflex vertex at (50,50). It is mirror-symmetric across
+// the diagonal y = x, so queries mirrored across that diagonal must have equal
+// lengths — an asymmetry means attachment broke a tie against the destination.
+const LSHAPE = [
+  [0, 0],
+  [100, 0],
+  [100, 50],
+  [50, 50],
+  [50, 100],
+  [0, 100],
+];
+
+test("a start exactly on a boundary reflex vertex routes optimally into either arm", () => {
+  // (50,50) is equidistant from three sites — the corner point site and both
+  // incident boundary segments — and the medial features flanking the corner
+  // tie for nearest. A single destination-blind connector detoured every path
+  // headed the other way (~92 instead of ~35 here).
+  const f = new MedialAxisPathFinder([LSHAPE]);
+  try {
+    const left = f.findPath([50, 50], [25, 75]);
+    const bottom = f.findPath([50, 50], [75, 25]);
+    assert.equal(left.found, true);
+    assert.equal(bottom.found, true);
+    assert.ok(
+      Math.abs(left.length - bottom.length) < 1e-6,
+      `asymmetric routes from the reflex vertex: ${left.length} vs ${bottom.length}`,
+    );
+    assert.ok(bottom.length < 60, `detoured through the far arm: ${bottom.length}`);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("attachment near a reflex vertex is destination-aware", () => {
+  // Strictly interior, but equidistant from the medial features on both sides
+  // of the reflex vertex — the tie must not be broken against the destination.
+  const f = new MedialAxisPathFinder([LSHAPE]);
+  try {
+    const left = f.findPath([49.99, 49.99], [25, 75]);
+    const bottom = f.findPath([49.99, 49.99], [75, 25]);
+    assert.equal(left.found, true);
+    assert.equal(bottom.found, true);
+    assert.ok(
+      Math.abs(left.length - bottom.length) < 1e-6,
+      `tie broken against the destination: ${left.length} vs ${bottom.length}`,
+    );
+    assert.ok(bottom.length < 60, `detoured through the far arm: ${bottom.length}`);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("a start on a wall endpoint at a reflex corner reaches both sides", () => {
+  // The wall runs from the reflex vertex to the outer boundary, sealing the
+  // bottom arm off from the left arm (the coverage-decomposition "portal"
+  // pattern). The start sits exactly on the junction — in the closure of both
+  // components — so it must attach on both sides: each destination is
+  // reachable, and neither route crosses the wall.
+  const wallA = xy([50, 50]);
+  const wallB = xy([50, 0]);
+  const f = new MedialAxisPathFinder([LSHAPE]);
+  try {
+    f.addWall([50, 50], [50, 0]);
+    const left = f.findPath([50, 50], [25, 75]);
+    const bottom = f.findPath([50, 50], [75, 25]);
+    assert.equal(left.found, true, "left arm unreachable from the junction");
+    assert.equal(bottom.found, true, "bottom arm unreachable from the junction");
+    assert.ok(!pathCrossesSegment(left.path, wallA, wallB), "left route crossed the wall");
+    assert.ok(!pathCrossesSegment(bottom.path, wallA, wallB), "bottom route crossed the wall");
+  } finally {
+    f.dispose();
+  }
+});
+
+test("a start on a wall–boundary T-junction reaches both sides", () => {
+  // The wall drops from (70,50) — the *interior* of a boundary edge, so its
+  // insertion creates a T-junction point site there — to the opposite
+  // boundary, splitting the bottom arm in two. A start exactly on the junction
+  // previously attached to an arbitrary side and reported "no path" toward
+  // the other.
+  const wallA = xy([70, 50]);
+  const wallB = xy([70, 0]);
+  const f = new MedialAxisPathFinder([LSHAPE]);
+  try {
+    f.addWall([70, 50], [70, 0]);
+    const left = f.findPath([70, 50], [25, 25]);
+    const right = f.findPath([70, 50], [85, 25]);
+    assert.equal(left.found, true, "left side unreachable from the T-junction");
+    assert.equal(right.found, true, "right side unreachable from the T-junction");
+    assert.ok(!pathCrossesSegment(left.path, wallA, wallB), "left route crossed the wall");
+    assert.ok(!pathCrossesSegment(right.path, wallA, wallB), "right route crossed the wall");
+  } finally {
+    f.dispose();
+  }
+});
+
 test("matisse-nuit routes between its default (extreme-axis) endpoints", () => {
   // Regression: an interior segment medial edge whose endpoint sat on the polygon
   // boundary was dropped by the interior test (which sampled an endpoint, not the

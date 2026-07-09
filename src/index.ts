@@ -716,9 +716,13 @@ export interface MedialPath {
  * walls are Voronoi sites the axis never crosses — a wall fully partitioning the
  * region makes the two sides unreachable (`found: false`).
  *
- * Each endpoint is attached to the axis by finding the Voronoi cell that
- * contains it and projecting onto the nearest medial edge bounding that cell,
- * with a straight connector. The whole finder (graph extraction, endpoint
+ * Each endpoint is attached to the axis by finding every Voronoi cell whose
+ * closure contains it — the nearest site's cell plus all tied cells, so a
+ * point exactly on a boundary reflex vertex, a wall endpoint, or a
+ * wall–boundary junction sees all of its sides — and adding a straight
+ * connector to each eligible medial feature bounding those cells; the search
+ * then picks the connector that serves the destination. The whole finder
+ * (graph extraction, endpoint
  * attachment, and the Dijkstra search) runs in C++/WASM, so adding a wall or
  * querying a path never marshals the full diagram across the JS boundary — only
  * the resulting polyline is returned.
