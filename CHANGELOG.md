@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.2] - 2026-07-10
+
+### Fixed
+
+- `MedialAxisPathFinder`: endpoint connectors are now checked against the
+  polygon's own boundary edges, not just walls. Near a narrow notch, a straight
+  connector could leave the region and re-enter a *different* pocket of it
+  without crossing any wall, attaching the endpoint to the wrong medial
+  component and reporting a spurious `found: false` between plainly connected
+  points.
+- `MedialAxisPathFinder`: the connector-blocking test now uses a grazing
+  tolerance (~1e-9 of the coordinate scale). An endpoint constructed exactly on
+  a boundary or wall edge carries machine-epsilon residue off the exact line,
+  which the strict crossing test read as a hair-width proper crossing of the
+  very edge the point sits on — wrongly rejecting valid connectors and causing
+  detours or spurious `found: false`.
+- `MedialAxisPathFinder`: coincident Voronoi-vertex duals no longer fragment
+  the medial graph. At a clearance-0 junction (a boundary reflex corner, a wall
+  endpoint on an edge) several Delaunay faces dualize to the same point; keyed
+  per face they formed distinct nodes joined by zero-length edges that were
+  then dropped, splitting the local axis into an island no path could leave.
+  Coincident duals are now merged along their (near-)zero-length connecting
+  edges — but only when the edge's sites are *not* an incident point–segment
+  pair, so the angular-sector boundaries at a pinch point still keep the two
+  sides of a partitioning wall apart. Near-equality (1e-9 of the coordinate
+  scale) covers positive-radius degeneracies whose independently computed
+  circumcenters agree only to ~1e-12.
+
+### Changed
+
+- `MedialAxisPathFinder`: the point-in-region test used during the medial-graph
+  rebuild is now banded by y-interval instead of scanning every ring edge per
+  query, substantially speeding up rebuilds after `addWall()` on large polygons.
+
 ## [3.4.1] - 2026-07-09
 
 ### Fixed

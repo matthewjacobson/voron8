@@ -579,22 +579,64 @@ double polyline_len(const std::vector<Point_2>& poly) {
 }
 
 // Even-odd point-in-region test over the polygon fill rings (holes are the
-// even-nesting regions), matching insideFilledRegion() in the JS layer.
-bool inside_fill(double px, double py, const std::vector<std::vector<Point_2>>& rings) {
-  bool inside = false;
-  for (const auto& ring : rings) {
-    const std::size_t n = ring.size();
-    if (n < 3) continue;
-    for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
-      const double xi = ring[i].x(), yi = ring[i].y();
-      const double xj = ring[j].x(), yj = ring[j].y();
-      const bool crosses = ((yi > py) != (yj > py)) &&
-                           (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
-      if (crosses) inside = !inside;
+// even-nesting regions), matching insideFilledRegion() in the JS layer — but
+// with the ring edges bucketed into horizontal bands, so a query tests only
+// the edges whose y-span can cross its ray instead of every edge. Exact: an
+// edge not spanning the query's y contributes nothing to the even-odd count,
+// so skipping it cannot change the result. This test runs once per candidate
+// medial edge on every rebuild, which made it the rebuild's dominant cost on
+// large inputs when it scanned all rings.
+class FillIndex {
+ public:
+  void build(const std::vector<std::vector<Point_2>>& rings) {
+    double ymin = std::numeric_limits<double>::infinity(), ymax = -ymin;
+    std::size_t edgeCount = 0;
+    for (const auto& ring : rings) {
+      if (ring.size() < 3) continue;
+      edgeCount += ring.size();
+      for (const auto& p : ring) { ymin = std::min(ymin, p.y()); ymax = std::max(ymax, p.y()); }
+    }
+    if (edgeCount == 0 || !(ymax > ymin)) { nbands_ = 0; return; }
+    nbands_ = static_cast<int>(std::min<std::size_t>(edgeCount, 256));
+    y0_ = ymin;
+    dy_ = (ymax - ymin) / nbands_;
+    bands_.assign(nbands_, {});
+    for (const auto& ring : rings) {
+      const std::size_t n = ring.size();
+      if (n < 3) continue;
+      for (std::size_t i = 0, j = n - 1; i < n; j = i++) {
+        const int b0 = bandOf(std::min(ring[i].y(), ring[j].y()));
+        const int b1 = bandOf(std::max(ring[i].y(), ring[j].y()));
+        for (int b = b0; b <= b1; ++b) bands_[b].emplace_back(ring[j], ring[i]);
+      }
     }
   }
-  return inside;
-}
+
+  bool inside(double px, double py) const {
+    if (nbands_ == 0) return false;
+    if (py < y0_ || py > y0_ + dy_ * nbands_) return false;
+    bool in = false;
+    for (const auto& e : bands_[bandOf(py)]) {
+      const double xi = e.second.x(), yi = e.second.y();
+      const double xj = e.first.x(), yj = e.first.y();
+      const bool crosses = ((yi > py) != (yj > py)) &&
+                           (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+      if (crosses) in = !in;
+    }
+    return in;
+  }
+
+ private:
+  int bandOf(double y) const {
+    int b = static_cast<int>((y - y0_) / dy_);
+    if (b < 0) b = 0;
+    if (b >= nbands_) b = nbands_ - 1;
+    return b;
+  }
+  double y0_ = 0, dy_ = 1;
+  int nbands_ = 0;
+  std::vector<std::vector<std::pair<Point_2, Point_2>>> bands_;
+};
 
 // Sample a parabolic bisector between p1 and p2 into a polyline, using the same
 // directrix-frame formula as the JS tessellate() (β = (α²−δ²)/(2δ)).
@@ -620,14 +662,25 @@ void sample_parabola(const Point_2& F, double la, double lb, double lc,
 // True when open segments ab and cd properly cross (interiors intersect at a
 // single point). Endpoint touching and collinear overlap return false, so a
 // connector may reach a point that merely coincides with a wall endpoint.
+// `tol` is an absolute distance: an endpoint within `tol` of the other
+// segment's line counts as touching, not crossing. Callers construct points
+// ON boundary edges (a fill lane's end, a portal midpoint on a cut) whose
+// coordinates carry ~machine-epsilon residue off the exact line; without the
+// tolerance that residue reads as a hair-width proper crossing of the very
+// edge the point sits on.
 bool segments_properly_cross(const Point_2& a, const Point_2& b,
-                             const Point_2& c, const Point_2& d) {
+                             const Point_2& c, const Point_2& d, double tol) {
   auto side = [](const Point_2& p, const Point_2& q, const Point_2& r) {
     return (q.x() - p.x()) * (r.y() - p.y()) - (q.y() - p.y()) * (r.x() - p.x());
   };
   const double d1 = side(c, d, a), d2 = side(c, d, b);
   const double d3 = side(a, b, c), d4 = side(a, b, d);
-  return d1 * d2 < 0 && d3 * d4 < 0;
+  if (!(d1 * d2 < 0 && d3 * d4 < 0)) return false;
+  // side() magnitude = segment length x the point's distance from its line.
+  const double tcd = std::hypot(d.x() - c.x(), d.y() - c.y()) * tol;
+  const double tab = std::hypot(b.x() - a.x(), b.y() - a.y()) * tol;
+  return std::min(std::abs(d1), std::abs(d2)) > tcd &&
+         std::min(std::abs(d3), std::abs(d4)) > tab;
 }
 
 // Closest point on a polyline to (x,y): the projection q, the index of the
@@ -683,12 +736,20 @@ class MedialPathFinder {
         pts.push_back(p);
         ring.push_back(p);
         boundaryVerts_.insert(p);  // polygon corners — where the axis touches the boundary
+        scale_ = std::max(scale_, std::max(std::abs(p.x()), std::abs(p.y())));
       }
       fillRings_.push_back(ring);
       for (int v = 0; v + 1 < n; ++v) idx.emplace_back(base + v, base + v + 1);
       if (n >= 2) idx.emplace_back(base + (n - 1), base + 0);  // close the ring
+      // Boundary edges join the walls as connector barriers: a straight
+      // connector that properly crosses one leaves the region — near a narrow
+      // notch it can reach a feature in a *different* pocket of the region
+      // through the exterior, without crossing any wall.
+      for (int v = 0; v < n; ++v)
+        barriers_.emplace_back(ring[v], ring[(v + 1) % n]);
     }
     if (!idx.empty()) sdg_.insert_segments(pts, idx.begin(), idx.end());
+    fillIndex_.build(fillRings_);
   }
 
   // Insert a wall segment the path may not cross. Incremental: the Delaunay
@@ -697,7 +758,7 @@ class MedialPathFinder {
     sdg_.insert(Point_2(x1, y1), Point_2(x2, y2));
     // Keep the wall segment so endpoint attachment can reject connectors that
     // would cross it (which would attach a point to the far side of the wall).
-    walls_.emplace_back(Point_2(x1, y1), Point_2(x2, y2));
+    barriers_.emplace_back(Point_2(x1, y1), Point_2(x2, y2));
     // A wall's endpoints are boundary corners just like the polygon's: the
     // Voronoi vertices sitting on them (clearance 0) anchor short stubs that
     // are not the skeleton's spine. Record them so endpoint attachment skips
@@ -705,7 +766,80 @@ class MedialPathFinder {
     // onBoundary_ preference), exactly as it does for polygon corners.
     boundaryVerts_.insert(Point_2(x1, y1));
     boundaryVerts_.insert(Point_2(x2, y2));
+    scale_ = std::max({scale_, std::abs(x1), std::abs(y1), std::abs(x2), std::abs(y2)});
     dirty_ = true;
+  }
+
+  // Expose the derived medial graph for inspection/overlays: nodes with their
+  // positions and boundary flag, edges as node-id pairs, plus every dropped
+  // finite-face edge with the reason it was dropped.
+  emscripten::val debugGraph() {
+    if (dirty_) rebuild();
+    emscripten::val out = emscripten::val::object();
+    emscripten::val nodes = emscripten::val::array();
+    for (std::size_t i = 0; i < nodePos_.size(); ++i) {
+      emscripten::val n = point_val(nodePos_[i]);
+      n.set("onBoundary", onBoundary_[i] != 0);
+      nodes.set(static_cast<int>(i), n);
+    }
+    emscripten::val edges = emscripten::val::array();
+    for (std::size_t i = 0; i < medialEdges_.size(); ++i) {
+      emscripten::val e = emscripten::val::object();
+      e.set("from", medialEdges_[i].from);
+      e.set("to", medialEdges_[i].to);
+      edges.set(static_cast<int>(i), e);
+    }
+    emscripten::val dropped = emscripten::val::array();
+    int di = 0;
+    for (auto eit = sdg_.finite_edges_begin(); eit != sdg_.finite_edges_end(); ++eit) {
+      Edge e = *eit;
+      Face_handle f1 = e.first;
+      Face_handle f2 = e.first->neighbor(e.second);
+      auto i1 = faceNode_.find(f1), i2 = faceNode_.find(f2);
+      const char* reason = nullptr;
+      Point_2 a(0, 0), b(0, 0);
+      if (sdg_.is_infinite(f1) || sdg_.is_infinite(f2) ||
+          i1 == faceNode_.end() || i2 == faceNode_.end()) {
+        reason = "infinite-face";
+      } else {
+        a = nodePos_[i1->second];
+        b = nodePos_[i2->second];
+        if (i1->second == i2->second) reason = "merged-selfloop";
+        else {
+          CGAL::Object o = sdg_.primal(e);
+          Segment_2 seg;
+          CGAL::Parabola_segment_2<Gt_with> parc;
+          std::vector<Point_2> poly;
+          if (CGAL::assign(seg, o)) { poly.push_back(seg.source()); poly.push_back(seg.target()); }
+          else if (CGAL::assign(parc, o)) {
+            const Line_2& dl = parc.line();
+            sample_parabola(parc.center(), to_double(dl.a()), to_double(dl.b()), to_double(dl.c()),
+                            parc.p1, parc.p2, 16, poly);
+          } else reason = "ray-line";
+          if (!reason) {
+            if (poly.size() < 2) reason = "short-poly";
+            else {
+              const std::size_t m = poly.size() / 2;
+              const Point_2 mid((poly[m - 1].x() + poly[m].x()) / 2,
+                                (poly[m - 1].y() + poly[m].y()) / 2);
+              if (!fillIndex_.inside(mid.x(), mid.y())) reason = "exterior";
+              else if (isIncident(e.first->vertex(sdg_.ccw(e.second)),
+                                  e.first->vertex(sdg_.cw(e.second)))) reason = "incident";
+            }
+          }
+        }
+      }
+      if (!reason) continue;
+      emscripten::val d = emscripten::val::object();
+      d.set("reason", std::string(reason));
+      d.set("ax", to_double(a.x())); d.set("ay", to_double(a.y()));
+      d.set("bx", to_double(b.x())); d.set("by", to_double(b.y()));
+      dropped.set(di++, d);
+    }
+    out.set("nodes", nodes);
+    out.set("edges", edges);
+    out.set("dropped", dropped);
+    return out;
   }
 
   // Route from (sx,sy) to (ex,ey) along the medial axis. Returns
@@ -833,15 +967,68 @@ class MedialPathFinder {
     edgeLookup_.clear();
     adj_.clear();
 
+    // A clearance-0 junction (a polygon corner, or a wall endpoint on a
+    // boundary edge) is the dual of SEVERAL Delaunay faces, all constructed as
+    // exactly the junction point. Keyed per face those coincident duals are
+    // distinct nodes whose connecting zero-length Voronoi edges are dropped
+    // below (no length, and their on-boundary midpoints fail the interior
+    // test) — splitting the local axis into an island no path can leave (the
+    // raw SDG has no degeneracy-removal policy, unlike computeVoronoi's
+    // adaptor). But blanket merging by coordinate is wrong too: at a pinch
+    // point the junction carries duals from BOTH sides of a wall, and fusing
+    // them opens a zero-width passage through the pinch. So merge exactly
+    // along the degenerate edges themselves: union two coincident duals when
+    // their zero-length connecting edge's sites are NOT an incident
+    // point-segment pair — incident bisectors are the walls'/edges' own
+    // perpendiculars at the junction, i.e. the boundaries between the
+    // junction's angular sectors, and must keep the sides apart.
+    std::map<Face_handle, int> faceSlot;
+    std::vector<Point_2> slotPos;
     for (auto fit = sdg_.finite_faces_begin(); fit != sdg_.finite_faces_end(); ++fit) {
       Face_handle f = fit;
-      const Point_2 vp = sdg_.primal(f);
-      faceNode_[f] = static_cast<int>(nodePos_.size());
-      nodePos_.push_back(vp);
-      // A Voronoi vertex coincident with a polygon corner sits on the boundary
-      // (clearance 0); its incident edges are the axis's boundary stubs. Endpoint
-      // attachment prefers to skip these in favour of the interior "spine".
-      onBoundary_.push_back(boundaryVerts_.count(vp) != 0 ? 1 : 0);
+      faceSlot[f] = static_cast<int>(slotPos.size());
+      slotPos.push_back(sdg_.primal(f));
+    }
+    std::vector<int> parent(slotPos.size());
+    for (std::size_t i = 0; i < parent.size(); ++i) parent[i] = static_cast<int>(i);
+    auto findRoot = [&](int x) {
+      while (parent[x] != x) x = parent[x] = parent[parent[x]];
+      return x;
+    };
+    // Near-equality, not exact: duals at a radius-0 junction are constructed
+    // as the corner point itself (bit-exact), but duals at a positive-radius
+    // degeneracy (e.g. four cotangent sites where a collinear boundary vertex's
+    // seam meets the axis) are independently computed circumcenters that agree
+    // only to ~1e-12 of the coordinate scale.
+    const double mergeTol = 1e-9 * scale_;
+    const double mergeTol2 = mergeTol * mergeTol;
+    for (auto eit = sdg_.finite_edges_begin(); eit != sdg_.finite_edges_end(); ++eit) {
+      Edge e = *eit;
+      Face_handle f1 = e.first;
+      Face_handle f2 = e.first->neighbor(e.second);
+      auto i1 = faceSlot.find(f1), i2 = faceSlot.find(f2);
+      if (i1 == faceSlot.end() || i2 == faceSlot.end()) continue;
+      const Point_2& p1 = slotPos[i1->second];
+      const Point_2& p2 = slotPos[i2->second];
+      if (sqdist(p1, p2) > mergeTol2) continue;  // not (near-)zero-length
+      if (isIncident(e.first->vertex(sdg_.ccw(e.second)),
+                     e.first->vertex(sdg_.cw(e.second))))
+        continue;  // sector boundary at a pinch — keep the sides apart
+      parent[findRoot(i1->second)] = findRoot(i2->second);
+    }
+    std::map<int, int> rootNode;
+    for (auto& [f, slot] : faceSlot) {
+      const int r = findRoot(slot);
+      auto ins = rootNode.emplace(r, static_cast<int>(nodePos_.size()));
+      if (ins.second) {
+        const Point_2& vp = slotPos[r];
+        nodePos_.push_back(vp);
+        // A Voronoi vertex coincident with a polygon corner sits on the boundary
+        // (clearance 0); its incident edges are the axis's boundary stubs. Endpoint
+        // attachment prefers to skip these in favour of the interior "spine".
+        onBoundary_.push_back(boundaryVerts_.count(vp) != 0 ? 1 : 0);
+      }
+      faceNode_[f] = ins.first->second;
     }
     adj_.resize(nodePos_.size());
 
@@ -855,6 +1042,9 @@ class MedialPathFinder {
       if (sdg_.is_infinite(f1) || sdg_.is_infinite(f2) ||
           i1 == faceNode_.end() || i2 == faceNode_.end())
         continue;
+      // Coincident duals merged into one node: their connecting edge is a
+      // zero-length degeneracy, not a graph edge.
+      if (i1->second == i2->second) continue;
 
       Vertex_handle va = e.first->vertex(sdg_.ccw(e.second));
       Vertex_handle vb = e.first->vertex(sdg_.cw(e.second));
@@ -885,7 +1075,7 @@ class MedialPathFinder {
       const std::size_t m = poly.size() / 2;
       const Point_2 mid((poly[m - 1].x() + poly[m].x()) / 2,
                         (poly[m - 1].y() + poly[m].y()) / 2);
-      if (!inside_fill(mid.x(), mid.y(), fillRings_)) continue;
+      if (!fillIndex_.inside(mid.x(), mid.y())) continue;
       // Drop the degenerate incident bisector between a polygon/wall vertex and
       // one of its own incident edges (perpendicular touching the boundary at a
       // single point — not part of the skeleton).
@@ -922,13 +1112,21 @@ class MedialPathFinder {
     return test(sa, sb) || test(sb, sa);
   }
 
-  // True when the straight connector a->b properly crosses any wall. Such a
-  // connector would attach the point to the wall's far side (a different
-  // medial-graph component when the wall separates the axis), so attachment
-  // must avoid it. Endpoint touching is allowed (routing around a wall tip).
-  bool connectorHitsWall(const Point_2& a, const Point_2& b) const {
-    for (const auto& w : walls_)
-      if (segments_properly_cross(a, b, w.first, w.second)) return true;
+  // True when the straight connector a->b properly crosses any barrier — a
+  // wall or a polygon boundary edge. Such a connector reaches its feature on
+  // the far side of a wall, or through the exterior (near a narrow notch a
+  // straight hop can leave the region and land in a different pocket of it) —
+  // in both cases attaching the point to the wrong medial component, the
+  // "no path even though it isn't blocked" bug. Endpoint touching is allowed:
+  // points and features may lie exactly ON a boundary or wall (a fill lane's
+  // end, a portal midpoint, a clearance-0 Voronoi vertex).
+  bool connectorBlocked(const Point_2& a, const Point_2& b) const {
+    // Grazing tolerance: ~1e-9 of the coordinate scale — far above the
+    // floating-point residue of points constructed on boundary edges, far
+    // below any real geometric separation.
+    const double tol = 1e-9 * scale_;
+    for (const auto& w : barriers_)
+      if (segments_properly_cross(a, b, w.first, w.second, tol)) return true;
     return false;
   }
 
@@ -1029,14 +1227,14 @@ class MedialPathFinder {
       const MEdge& me = medialEdges_[id];
       const Proj pr = project_polyline(x, y, me.poly);
       if (pr.d2 < fbProj.d2) { fbProj = pr; fbEdge = id; }
-      if (!connectorHitsWall(p, pr.q)) {
+      if (!connectorBlocked(p, pr.q)) {
         anyEdges.emplace(id, pr);
         if (!onBoundary_[me.from] && !onBoundary_[me.to]) intEdges.emplace(id, pr);
       }
       for (int n : {me.from, me.to}) {
         if (!onBoundary_[n] && !intVerts.count(n)) {
           const double d2 = sqdist(p, nodePos_[n]);
-          if (!connectorHitsWall(p, nodePos_[n])) intVerts.emplace(n, d2);
+          if (!connectorBlocked(p, nodePos_[n])) intVerts.emplace(n, d2);
         }
       }
     };
@@ -1152,8 +1350,10 @@ class MedialPathFinder {
 
   PF_SDG sdg_;
   std::vector<std::vector<Point_2>> fillRings_;
+  FillIndex fillIndex_;  // banded interior test over the (fixed) fill rings
   std::set<Point_2, PointLess> boundaryVerts_;  // polygon corners + wall endpoints
-  std::vector<std::pair<Point_2, Point_2>> walls_;  // wall segments (for connector tests)
+  std::vector<std::pair<Point_2, Point_2>> barriers_;  // boundary edges + walls (connector tests)
+  double scale_ = 1.0;  // max |coordinate| seen — sets the grazing tolerance
   bool dirty_;
 
   // Cached medial-axis graph (valid while !dirty_).
@@ -1174,5 +1374,6 @@ EMSCRIPTEN_BINDINGS(voron8) {
   emscripten::class_<MedialPathFinder>("MedialPathFinder")
       .constructor<emscripten::val, emscripten::val>()
       .function("addWall", &MedialPathFinder::addWall)
-      .function("findPath", &MedialPathFinder::findPath);
+      .function("findPath", &MedialPathFinder::findPath)
+      .function("debugGraph", &MedialPathFinder::debugGraph);
 }
